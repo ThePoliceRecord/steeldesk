@@ -85,4 +85,6 @@ pub mod transport;
 
 pub mod hdr;
 
+pub mod tone_mapping;
+
 pub mod session_store;
