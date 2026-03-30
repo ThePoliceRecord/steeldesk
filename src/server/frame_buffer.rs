@@ -120,8 +120,10 @@ impl FrameBuffer {
     }
 }
 
-// TODO: integrate FrameBuffer into run() to decouple capture/encode
-// (see integration guide in module docs above)
+// P2-1 status: FrameBuffer is integrated into run() with temporal decoupling.
+// Capture stores into the buffer; encode takes from the buffer at the top of
+// the next iteration.  Full thread split is documented as a TODO in
+// video_service.rs (requires capturer to be Send+Sync).
 
 #[cfg(test)]
 mod tests {

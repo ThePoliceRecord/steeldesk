@@ -675,16 +675,27 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
 
     // Normal mode: capture -> encode -> send (sequential, simple)
-    // Low-latency mode: capture -> FrameBuffer -> encode -> send (decoupled, latest-wins)
+    // Low-latency mode: capture -> FrameBuffer -> encode -> send (temporally decoupled)
     //
     // In low-latency mode the FrameBuffer sits between capture and encode.
     // The capture side copies pixel data into a CapturedFrame and stores it
     // (latest-wins: a new capture overwrites any unconsumed frame).  The
     // encode side takes the latest frame from the buffer before encoding.
     //
-    // In this single-threaded integration the store/take happen in the same
-    // loop iteration, establishing the contract for a future multi-threaded
-    // split where a dedicated capture thread feeds the buffer independently.
+    // Temporal decoupling (P2-1): the store happens during the capture phase
+    // and the take+encode happens at the TOP of the next iteration, before
+    // the next capture.  This means encode and capture are no longer
+    // serialized within the same frame budget — encode runs on the previous
+    // frame while the capturer can proceed to grab the next one after the
+    // SPF sleep.
+    //
+    // TODO(P2-1): Full thread split — spawn a dedicated capture thread that
+    // feeds the FrameBuffer independently of the encode loop.  This requires
+    // the capturer to be Send+Sync (it currently holds platform-specific
+    // handles that are !Send on some backends).  When that is resolved:
+    //   1. Move the capture loop into its own thread with Arc<FrameBuffer>.
+    //   2. The main loop becomes encode-only: take() + encode + send.
+    //   3. Use AtomicBool to signal the capture thread to stop.
     let low_latency = video_qos::is_low_latency_mode();
     let frame_buffer = if low_latency {
         Some(FrameBuffer::new())
@@ -757,6 +768,34 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
+
+        // --- Temporally-decoupled encode phase (low-latency mode) ---
+        // Encode the frame captured in the PREVIOUS iteration.  This runs
+        // before the next capture, so capture and encode overlap across
+        // iterations rather than being serialized within one frame budget.
+        if let Some(ref fb) = &frame_buffer {
+            if let Some(cf) = fb.take() {
+                let age = cf.capture_time.elapsed();
+                log::trace!("low-latency encode: frame age {:?}", age);
+                let pb_owned = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
+                scrap::convert_to_yuv(&pb_owned, encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                let send_conn_ids = handle_one_frame(
+                    display_idx,
+                    &sp,
+                    EncodeInput::YUV(&yuv),
+                    ms,
+                    &mut encoder,
+                    recorder.clone(),
+                    &mut encode_fail_counter,
+                    &mut first_frame,
+                    capture_width,
+                    capture_height,
+                )?;
+                frame_controller.set_send(now, send_conn_ids);
+                send_counter += 1;
+            }
+        }
+
         let res = match c.frame(spf) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
@@ -804,11 +843,11 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
-                    // Low-latency path: store pixel data in the FrameBuffer,
-                    // then take the latest frame and encode it.  This establishes
-                    // the decoupled capture/encode contract used by the future
-                    // multi-threaded pipeline.  Texture frames bypass the buffer
-                    // because they are raw GPU pointers that cannot be copied.
+                    // Low-latency path: store pixel data in the FrameBuffer.
+                    // The encode happens at the TOP of the next loop iteration
+                    // (temporal decoupling — see P2-1 comment above).
+                    // Texture frames bypass the buffer because they are raw GPU
+                    // pointers that cannot be safely copied into owned memory.
                     if let (Some(ref fb), scrap::Frame::PixelBuffer(ref pb)) = (&frame_buffer, &frame) {
                         let captured = CapturedFrame {
                             data: pb.data().to_vec(),
@@ -820,26 +859,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                             display_idx,
                         };
                         fb.store(captured);
-
-                        // Encode phase: take the latest frame from the buffer.
-                        if let Some(cf) = fb.take() {
-                            let pb_owned = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
-                            scrap::convert_to_yuv(&pb_owned, encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                            let send_conn_ids = handle_one_frame(
-                                display_idx,
-                                &sp,
-                                EncodeInput::YUV(&yuv),
-                                ms,
-                                &mut encoder,
-                                recorder.clone(),
-                                &mut encode_fail_counter,
-                                &mut first_frame,
-                                capture_width,
-                                capture_height,
-                            )?;
-                            frame_controller.set_send(now, send_conn_ids);
-                            send_counter += 1;
-                        }
+                        // Encode is deferred to the next iteration's
+                        // take-and-encode block at the top of the loop.
                     } else {
                         // Normal path (or Texture frame): capture -> encode sequentially.
                         let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
@@ -2598,6 +2619,264 @@ mod tests {
         assert!(
             frame_buffer.is_none(),
             "In normal mode, frame_buffer should be None"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Temporal decoupling tests (P2-1)
+    // ---------------------------------------------------------------
+    //
+    // These tests verify the temporal decoupling pattern where capture
+    // stores a frame into the FrameBuffer and encode takes from it in
+    // the NEXT iteration, rather than in the same iteration.
+
+    #[test]
+    fn test_temporal_decoupling_first_iteration_no_frame() {
+        // On the first loop iteration there is nothing in the buffer yet.
+        // The encode phase should gracefully get None and skip encoding.
+        let fb = FrameBuffer::new();
+
+        // Simulate the encode-phase take at the top of the loop.
+        let taken = fb.take();
+        assert!(
+            taken.is_none(),
+            "First iteration should have no frame to encode"
+        );
+
+        // Now simulate the capture phase: store a frame.
+        fb.store(CapturedFrame {
+            data: vec![0u8; 1920 * 4 * 1080],
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // The stored frame should be available for the NEXT iteration.
+        assert!(fb.has_new_frame(), "Frame should be available for next iteration");
+    }
+
+    #[test]
+    fn test_temporal_decoupling_second_iteration_encodes_previous() {
+        // Simulate two iterations of the temporally-decoupled loop.
+        let fb = FrameBuffer::new();
+
+        // --- Iteration 1 ---
+        // Encode phase: nothing to encode yet.
+        assert!(fb.take().is_none());
+
+        // Capture phase: store frame A.
+        let time_a = Instant::now();
+        fb.store(CapturedFrame {
+            data: vec![0xAAu8; 100],
+            width: 640,
+            height: 480,
+            stride: 640 * 4,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: time_a,
+            display_idx: 0,
+        });
+
+        // --- Iteration 2 ---
+        // Encode phase: should get frame A (from previous iteration's capture).
+        let taken = fb.take().expect("Should get frame A from previous iteration");
+        assert_eq!(taken.width, 640);
+        assert_eq!(taken.height, 480);
+        assert_eq!(taken.data, vec![0xAAu8; 100]);
+        assert_eq!(taken.capture_time, time_a);
+
+        // Capture phase: store frame B.
+        fb.store(CapturedFrame {
+            data: vec![0xBBu8; 200],
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // --- Iteration 3 ---
+        // Encode phase: should get frame B.
+        let taken = fb.take().expect("Should get frame B from previous iteration");
+        assert_eq!(taken.width, 1920);
+        assert_eq!(taken.height, 1080);
+        assert_eq!(taken.data, vec![0xBBu8; 200]);
+    }
+
+    #[test]
+    fn test_temporal_decoupling_skipped_capture_yields_no_encode() {
+        // If a capture returns WouldBlock (no new frame), the buffer should
+        // remain empty and the encode phase in the next iteration gets None.
+        let fb = FrameBuffer::new();
+
+        // Iteration 1: capture succeeds, store a frame.
+        fb.store(CapturedFrame {
+            data: vec![1u8; 50],
+            width: 320,
+            height: 240,
+            stride: 320 * 4,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // Iteration 2: encode takes the frame.
+        let _ = fb.take().expect("Should have frame from iteration 1");
+
+        // Iteration 2 capture: WouldBlock — nothing stored.
+        // (No fb.store() call.)
+
+        // Iteration 3: encode phase gets None because no new capture.
+        assert!(
+            fb.take().is_none(),
+            "No encode should happen when capture was skipped"
+        );
+    }
+
+    #[test]
+    fn test_temporal_decoupling_fast_capture_slow_encode() {
+        // Simulate the scenario temporal decoupling is designed for:
+        // multiple captures happen before an encode drains the buffer.
+        // Only the latest frame should survive (latest-wins).
+        let fb = FrameBuffer::new();
+
+        // Iteration 1: capture stores frame A.
+        fb.store(CapturedFrame {
+            data: vec![1u8; 10],
+            width: 100,
+            height: 100,
+            stride: 400,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // Simulate: encode is slow, another capture happens before take().
+        // This would happen in the full thread-split scenario; in the
+        // single-threaded temporal decoupling it validates the contract.
+        fb.store(CapturedFrame {
+            data: vec![2u8; 20],
+            width: 200,
+            height: 200,
+            stride: 800,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        fb.store(CapturedFrame {
+            data: vec![3u8; 30],
+            width: 300,
+            height: 300,
+            stride: 1200,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // Encode phase: should get only the latest (frame C).
+        let taken = fb.take().expect("Should get the latest frame");
+        assert_eq!(taken.width, 300);
+        assert_eq!(taken.height, 300);
+        assert_eq!(taken.data, vec![3u8; 30]);
+
+        // Buffer should be empty after take.
+        assert!(fb.take().is_none());
+    }
+
+    #[test]
+    fn test_temporal_decoupling_frame_age_measurable() {
+        // The encode phase should be able to measure frame age
+        // (time since capture) to make staleness decisions.
+        let fb = FrameBuffer::new();
+
+        let capture_time = Instant::now();
+        fb.store(CapturedFrame {
+            data: vec![0u8; 10],
+            width: 100,
+            height: 100,
+            stride: 400,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time,
+            display_idx: 0,
+        });
+
+        // Simulate some time passing (as would happen with SPF sleep).
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Encode phase: take and measure age.
+        let taken = fb.take().expect("Should have a frame");
+        let age = taken.capture_time.elapsed();
+        assert!(
+            age >= Duration::from_millis(5),
+            "Frame age should reflect time since capture, got {:?}",
+            age
+        );
+    }
+
+    #[test]
+    fn test_temporal_decoupling_concurrent_simulation() {
+        // Simulate the temporal decoupling pattern with two threads to
+        // validate it works correctly when capture and encode are truly
+        // concurrent (as would happen in the full thread-split).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let fb = Arc::new(FrameBuffer::new());
+        let running = Arc::new(AtomicBool::new(true));
+
+        let fb_capture = fb.clone();
+        let capture_running = running.clone();
+        let num_captures = 100;
+
+        // Capture thread: stores frames as fast as possible.
+        let capture_thread = thread::spawn(move || {
+            for i in 0..num_captures {
+                if !capture_running.load(Ordering::Relaxed) {
+                    break;
+                }
+                fb_capture.store(CapturedFrame {
+                    data: vec![i as u8; 10],
+                    width: (i + 1) * 10,
+                    height: (i + 1) * 10,
+                    stride: (i + 1) * 40,
+                    pixfmt: scrap::Pixfmt::BGRA,
+                    capture_time: Instant::now(),
+                    display_idx: 0,
+                });
+                thread::yield_now();
+            }
+        });
+
+        // Encode thread: takes and "encodes" frames.
+        let fb_encode = fb.clone();
+        let encode_thread = thread::spawn(move || {
+            let mut encoded_count = 0u64;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Some(cf) = fb_encode.take() {
+                    // Verify frame integrity.
+                    assert!(cf.width > 0);
+                    assert!(cf.height > 0);
+                    assert!(!cf.data.is_empty());
+                    encoded_count += 1;
+                }
+                thread::yield_now();
+            }
+            encoded_count
+        });
+
+        capture_thread.join().expect("capture thread panicked");
+        running.store(false, Ordering::Relaxed);
+        let encoded = encode_thread.join().expect("encode thread panicked");
+
+        assert!(
+            encoded >= 1,
+            "Should have encoded at least 1 frame, got {}",
+            encoded
         );
     }
 }

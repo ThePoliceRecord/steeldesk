@@ -19,6 +19,7 @@
 //! adapter translates between the protobuf `Message` API that the session
 //! loop expects and the raw bytes that `Transport` uses.
 
+use async_trait::async_trait;
 use bytes::BytesMut;
 use hbb_common::sodiumoxide;
 use std::io;
@@ -144,6 +145,64 @@ impl QuicStream {
     }
 }
 
+/// Implement `DynStream` so that `QuicStream` can be used as
+/// `hbb_common::Stream::Custom(Box::new(quic_stream))`.
+///
+/// This allows all existing code paths that accept `hbb_common::Stream`
+/// (rendezvous_mediator, port_forward, file transfer, etc.) to use QUIC
+/// without needing `SessionTransport` wrappers.
+#[async_trait]
+impl hbb_common::stream::DynStream for QuicStream {
+    async fn send_msg(&mut self, msg_bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+        self.send_raw(msg_bytes).await
+    }
+
+    async fn send_raw(&mut self, bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+        QuicStream::send_raw(self, bytes).await
+    }
+
+    async fn send_bytes(&mut self, bytes: bytes::Bytes) -> hbb_common::ResultType<()> {
+        QuicStream::send_bytes(self, bytes).await
+    }
+
+    async fn next(&mut self) -> Option<Result<BytesMut, io::Error>> {
+        QuicStream::next(self).await
+    }
+
+    async fn next_timeout(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Option<Result<BytesMut, io::Error>> {
+        QuicStream::next_timeout(self, timeout_ms).await
+    }
+
+    fn set_key(&mut self, key: sodiumoxide::crypto::secretbox::Key) {
+        QuicStream::set_key(self, key)
+    }
+
+    fn set_raw(&mut self) {
+        QuicStream::set_raw(self)
+    }
+
+    fn set_send_timeout(&mut self, ms: u64) {
+        QuicStream::set_send_timeout(self, ms)
+    }
+
+    fn is_secured(&self) -> bool {
+        QuicStream::is_secured(self)
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        QuicStream::local_addr(self)
+    }
+}
+
+impl From<QuicStream> for hbb_common::Stream {
+    fn from(qs: QuicStream) -> Self {
+        hbb_common::Stream::from_custom(qs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +243,145 @@ mod tests {
         fn _assert_local_addr(qs: &QuicStream) -> SocketAddr {
             qs.local_addr()
         }
+    }
+
+    #[test]
+    fn quic_stream_converts_to_hbb_stream() {
+        // Verify that QuicStream can be converted to hbb_common::Stream
+        // via From<QuicStream>. This is a compile-time check.
+        fn _assert_into_stream(qs: QuicStream) -> hbb_common::Stream {
+            qs.into()
+        }
+    }
+
+    #[test]
+    fn quic_stream_as_dyn_stream_compiles() {
+        // Verify that QuicStream implements DynStream and can be boxed.
+        fn _assert_dyn(qs: QuicStream) -> Box<dyn hbb_common::stream::DynStream> {
+            Box::new(qs)
+        }
+    }
+
+    #[test]
+    fn stream_custom_variant_from_mock() {
+        // Verify Stream::Custom works with a mock DynStream implementation.
+        use hbb_common::stream::DynStream;
+
+        struct MockStream {
+            secured: bool,
+            addr: SocketAddr,
+        }
+
+        #[async_trait]
+        impl DynStream for MockStream {
+            async fn send_msg(&mut self, _msg_bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+                Ok(())
+            }
+            async fn send_raw(&mut self, _bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+                Ok(())
+            }
+            async fn send_bytes(&mut self, _bytes: bytes::Bytes) -> hbb_common::ResultType<()> {
+                Ok(())
+            }
+            async fn next(&mut self) -> Option<Result<bytes::BytesMut, io::Error>> {
+                None
+            }
+            async fn next_timeout(
+                &mut self,
+                _timeout_ms: u64,
+            ) -> Option<Result<bytes::BytesMut, io::Error>> {
+                None
+            }
+            fn set_key(&mut self, _key: sodiumoxide::crypto::secretbox::Key) {}
+            fn set_raw(&mut self) {}
+            fn set_send_timeout(&mut self, _ms: u64) {}
+            fn is_secured(&self) -> bool {
+                self.secured
+            }
+            fn local_addr(&self) -> SocketAddr {
+                self.addr
+            }
+        }
+
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mock = MockStream {
+            secured: true,
+            addr,
+        };
+
+        let stream = hbb_common::Stream::from_custom(mock);
+        assert!(stream.is_secured());
+        assert_eq!(stream.local_addr(), addr);
+    }
+
+    #[test]
+    fn stream_custom_send_recv_with_mock() {
+        // Verify async methods work through Stream::Custom.
+        use hbb_common::stream::DynStream;
+        use hbb_common::tokio;
+        use std::collections::VecDeque;
+
+        struct ChannelStream {
+            outbox: Vec<Vec<u8>>,
+            inbox: VecDeque<Vec<u8>>,
+        }
+
+        #[async_trait]
+        impl DynStream for ChannelStream {
+            async fn send_msg(&mut self, msg_bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+                self.outbox.push(msg_bytes);
+                Ok(())
+            }
+            async fn send_raw(&mut self, bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+                self.outbox.push(bytes);
+                Ok(())
+            }
+            async fn send_bytes(&mut self, bytes: bytes::Bytes) -> hbb_common::ResultType<()> {
+                self.outbox.push(bytes.to_vec());
+                Ok(())
+            }
+            async fn next(&mut self) -> Option<Result<bytes::BytesMut, io::Error>> {
+                self.inbox
+                    .pop_front()
+                    .map(|data| Ok(bytes::BytesMut::from(data.as_slice())))
+            }
+            async fn next_timeout(
+                &mut self,
+                _timeout_ms: u64,
+            ) -> Option<Result<bytes::BytesMut, io::Error>> {
+                self.next().await
+            }
+            fn set_key(&mut self, _key: sodiumoxide::crypto::secretbox::Key) {}
+            fn set_raw(&mut self) {}
+            fn set_send_timeout(&mut self, _ms: u64) {}
+            fn is_secured(&self) -> bool {
+                true
+            }
+            fn local_addr(&self) -> SocketAddr {
+                "0.0.0.0:0".parse().unwrap()
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut inbox = VecDeque::new();
+            inbox.push_back(b"hello from mock".to_vec());
+
+            let mut stream = hbb_common::Stream::from_custom(ChannelStream {
+                outbox: Vec::new(),
+                inbox,
+            });
+
+            // Test send_raw through Stream::Custom.
+            stream.send_raw(b"test data".to_vec()).await.unwrap();
+
+            // Test next through Stream::Custom.
+            let received = stream.next().await.unwrap().unwrap();
+            assert_eq!(&received[..], b"hello from mock");
+
+            // Inbox is now empty; next should return None.
+            assert!(stream.next().await.is_none());
+        });
     }
 
     /// When quic-transport feature is enabled, test with a real loopback pair.

@@ -2297,14 +2297,15 @@ impl Connection {
             self.options_in_login = Some(o.clone());
         }
         if self.require_2fa.is_some() && !lr.hwid.is_empty() && Self::enable_trusted_devices() {
+            let hashed = crate::hwid_attestation::hash_hwid(&lr.hwid);
             let devices = Config::get_trusted_devices();
-            if let Some(device) = devices.iter().find(|d| d.hwid == lr.hwid) {
+            if let Some(device) = devices.iter().find(|d| d.hwid == hashed.as_slice()) {
                 if !device.outdate()
                     && device.id == lr.my_id
                     && device.name == lr.my_name
                     && device.platform == lr.my_platform
                 {
-                    log::info!("2FA bypassed by trusted devices");
+                    log::info!("2FA bypassed by trusted device (HWID attested)");
                     self.require_2fa = None;
                 }
             }
@@ -2593,8 +2594,9 @@ impl Connection {
                             self.authorized,
                         );
                         if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
+                            let hashed_hwid = crate::hwid_attestation::hash_hwid(&tfa.hwid);
                             Config::add_trusted_device(TrustedDevice {
-                                hwid: tfa.hwid,
+                                hwid: hashed_hwid.into(),
                                 time: hbb_common::get_time(),
                                 id: self.lr.my_id.clone(),
                                 name: self.lr.my_name.clone(),
