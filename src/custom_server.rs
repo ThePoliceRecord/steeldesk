@@ -216,4 +216,220 @@ mod test {
             get_custom_server_from_string("rustdesk-licensed--0nI900VsFHZVBVdIlncwpHS4V0bOZ0dtVldrpVO4JHdCp0YV5WdzUGZzdnYRVjI6ISeltmIsISMuEjLx4SMiojI0N3boJye--.exe")
                 .unwrap(), lic);
     }
+
+    // --- Edge cases for host= parsing ---
+
+    #[test]
+    fn test_empty_string() {
+        assert!(get_custom_server_from_string("").is_err());
+    }
+
+    #[test]
+    fn test_just_exe_extension() {
+        assert!(get_custom_server_from_string(".exe").is_err());
+    }
+
+    #[test]
+    fn test_double_exe_extension_stripped() {
+        // .exe.exe should be stripped, then parsed
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=myhost.exe.exe").unwrap(),
+            CustomServer {
+                host: "myhost".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_host_only_no_exe() {
+        // No .exe extension
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=10.0.0.1").unwrap(),
+            CustomServer {
+                host: "10.0.0.1".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_all_fields() {
+        assert_eq!(
+            get_custom_server_from_string(
+                "rustdesk-host=myhost.com,key=MYKEY,api=https://api.myhost.com,relay=relay.myhost.com.exe"
+            )
+            .unwrap(),
+            CustomServer {
+                host: "myhost.com".to_owned(),
+                key: "MYKEY".to_owned(),
+                api: "https://api.myhost.com".to_owned(),
+                relay: "relay.myhost.com".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_fields_in_different_order() {
+        // Parsing starts from "host=" and only sees fields AFTER it.
+        // Fields before "host=" are ignored (by design — see line 60).
+        // So host must come first for other fields to be parsed.
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=h.com,relay=r.com,key=K,api=a.com.exe")
+                .unwrap(),
+            CustomServer {
+                host: "h.com".to_owned(),
+                key: "K".to_owned(),
+                api: "a.com".to_owned(),
+                relay: "r.com".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_duplicate_fields_last_wins() {
+        // When a field appears multiple times, each overwrites the previous
+        let result =
+            get_custom_server_from_string("rustdesk-host=first.com,host=second.com.exe").unwrap();
+        assert_eq!(result.host, "second.com");
+    }
+
+    #[test]
+    fn test_case_insensitive_keys() {
+        // Keys are case-insensitive
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-HOST=h.com,KEY=k,API=a.com,RELAY=r.com.exe")
+                .unwrap(),
+            CustomServer {
+                host: "h.com".to_owned(),
+                key: "k".to_owned(),
+                api: "a.com".to_owned(),
+                relay: "r.com".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_host_with_port() {
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=myserver.com:21116.exe").unwrap(),
+            CustomServer {
+                host: "myserver.com:21116".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_host_ipv4() {
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=192.168.1.100.exe").unwrap(),
+            CustomServer {
+                host: "192.168.1.100".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_prefix_before_host_is_ignored() {
+        // Anything before "host=" is stripped
+        assert_eq!(
+            get_custom_server_from_string("some-prefix-garbage-host=myhost.com.exe").unwrap(),
+            CustomServer {
+                host: "myhost.com".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_trailing_comma_produces_empty_token() {
+        // Trailing comma: the last token is empty, doesn't match any key
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=myhost.com,.exe").unwrap(),
+            CustomServer {
+                host: "myhost.com".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_empty_host_value() {
+        // host= with no value
+        assert_eq!(
+            get_custom_server_from_string("rustdesk-host=.exe").unwrap(),
+            CustomServer {
+                host: "".to_owned(),
+                key: "".to_owned(),
+                api: "".to_owned(),
+                relay: "".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_no_host_no_license_fails() {
+        // No "host=" and no valid license blob
+        assert!(get_custom_server_from_string("rustdesk-something-else.exe").is_err());
+    }
+
+    #[test]
+    fn test_garbage_license_blob_fails() {
+        // Double-dash delimited but invalid base64/signature
+        assert!(get_custom_server_from_string("rustdesk--notavalidblob--.exe").is_err());
+    }
+
+    #[test]
+    fn test_custom_server_default() {
+        let cs = CustomServer::default();
+        assert_eq!(cs.host, "");
+        assert_eq!(cs.key, "");
+        assert_eq!(cs.api, "");
+        assert_eq!(cs.relay, "");
+    }
+
+    #[test]
+    fn test_custom_server_serialization_roundtrip() {
+        let cs = CustomServer {
+            host: "h.com".to_owned(),
+            key: "k".to_owned(),
+            api: "a.com".to_owned(),
+            relay: "r.com".to_owned(),
+        };
+        let json = serde_json::to_string(&cs).unwrap();
+        let deserialized: CustomServer = serde_json::from_str(&json).unwrap();
+        assert_eq!(cs, deserialized);
+    }
+
+    #[test]
+    fn test_custom_server_deserialize_missing_fields() {
+        // All fields have #[serde(default)], so missing fields should be empty strings
+        let json = r#"{"host":"h.com"}"#;
+        let cs: CustomServer = serde_json::from_str(json).unwrap();
+        assert_eq!(cs.host, "h.com");
+        assert_eq!(cs.key, "");
+        assert_eq!(cs.api, "");
+        assert_eq!(cs.relay, "");
+    }
+
+    #[test]
+    fn test_custom_server_deserialize_empty_json() {
+        let json = "{}";
+        let cs: CustomServer = serde_json::from_str(json).unwrap();
+        assert_eq!(cs, CustomServer::default());
+    }
 }

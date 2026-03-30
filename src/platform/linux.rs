@@ -1851,6 +1851,731 @@ mod desktop {
                 }
             }
         }
+
+        // -----------------------------------------------------------
+        // Desktop struct: is_wayland()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_is_wayland_true() {
+            let d = Desktop {
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                ..Default::default()
+            };
+            assert!(d.is_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_wayland_false_x11() {
+            let d = Desktop {
+                protocol: DISPLAY_SERVER_X11.to_string(),
+                ..Default::default()
+            };
+            assert!(!d.is_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_wayland_false_empty() {
+            let d = Desktop::default();
+            assert!(!d.is_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_wayland_false_arbitrary() {
+            let d = Desktop {
+                protocol: "mir".to_string(),
+                ..Default::default()
+            };
+            assert!(!d.is_wayland());
+        }
+
+        // -----------------------------------------------------------
+        // Desktop struct: is_login_wayland()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_is_login_wayland_gdm_wayland() {
+            let d = Desktop {
+                username: "gdm".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                ..Default::default()
+            };
+            assert!(d.is_login_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_login_wayland_sddm_wayland() {
+            let d = Desktop {
+                username: "sddm".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                ..Default::default()
+            };
+            assert!(d.is_login_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_login_wayland_gdm_x11() {
+            let d = Desktop {
+                username: "gdm".to_string(),
+                protocol: DISPLAY_SERVER_X11.to_string(),
+                ..Default::default()
+            };
+            assert!(!d.is_login_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_login_wayland_normal_user_wayland() {
+            let d = Desktop {
+                username: "alice".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                ..Default::default()
+            };
+            assert!(!d.is_login_wayland());
+        }
+
+        #[test]
+        fn test_desktop_is_login_wayland_empty() {
+            let d = Desktop::default();
+            assert!(!d.is_login_wayland());
+        }
+
+        // -----------------------------------------------------------
+        // Desktop struct: is_headless()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_is_headless_empty_sid() {
+            let d = Desktop {
+                sid: "".to_string(),
+                is_rustdesk_subprocess: false,
+                ..Default::default()
+            };
+            assert!(d.is_headless());
+        }
+
+        #[test]
+        fn test_desktop_is_headless_subprocess() {
+            let d = Desktop {
+                sid: "c1".to_string(),
+                is_rustdesk_subprocess: true,
+                ..Default::default()
+            };
+            assert!(d.is_headless());
+        }
+
+        #[test]
+        fn test_desktop_is_headless_false() {
+            let d = Desktop {
+                sid: "c1".to_string(),
+                is_rustdesk_subprocess: false,
+                ..Default::default()
+            };
+            assert!(!d.is_headless());
+        }
+
+        #[test]
+        fn test_desktop_is_headless_empty_sid_and_subprocess() {
+            let d = Desktop {
+                sid: "".to_string(),
+                is_rustdesk_subprocess: true,
+                ..Default::default()
+            };
+            assert!(d.is_headless());
+        }
+
+        // -----------------------------------------------------------
+        // Desktop struct: default values
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_default() {
+            let d = Desktop::default();
+            assert!(d.sid.is_empty());
+            assert!(d.username.is_empty());
+            assert!(d.uid.is_empty());
+            assert!(d.protocol.is_empty());
+            assert!(d.display.is_empty());
+            assert!(d.xauth.is_empty());
+            assert!(d.home.is_empty());
+            assert!(d.dbus.is_empty());
+            assert!(!d.is_rustdesk_subprocess);
+            assert!(d.wl_display.is_empty());
+        }
+
+        // -----------------------------------------------------------
+        // is_gdm_user() — re-exported from hbb_common
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_is_gdm_user_gdm() {
+            assert!(is_gdm_user("gdm"));
+        }
+
+        #[test]
+        fn test_is_gdm_user_sddm() {
+            assert!(is_gdm_user("sddm"));
+        }
+
+        #[test]
+        fn test_is_gdm_user_regular() {
+            assert!(!is_gdm_user("alice"));
+            assert!(!is_gdm_user("root"));
+            assert!(!is_gdm_user(""));
+        }
+
+        #[test]
+        fn test_is_gdm_user_similar_names() {
+            assert!(!is_gdm_user("gdm3"));
+            assert!(!is_gdm_user("lightgdm"));
+            assert!(!is_gdm_user("sddm-greeter"));
+        }
+
+        // -----------------------------------------------------------
+        // get_xrandr_conn_pat() — regex pattern construction
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_get_xrandr_conn_pat_matches_connected_output() {
+            let pat = super::super::get_xrandr_conn_pat("eDP-1");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 344mm x 193mm\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1080");
+            assert_eq!(caps.name("x").unwrap().as_str(), "0");
+            assert_eq!(caps.name("y").unwrap().as_str(), "0");
+        }
+
+        #[test]
+        fn test_get_xrandr_conn_pat_matches_secondary_display() {
+            let pat = super::super::get_xrandr_conn_pat("HDMI-1");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "HDMI-1 connected 2560x1440+1920+0 (normal left inverted right x axis y axis) 553mm x 311mm\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "2560");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1440");
+            assert_eq!(caps.name("x").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("y").unwrap().as_str(), "0");
+        }
+
+        #[test]
+        fn test_get_xrandr_conn_pat_no_match_disconnected() {
+            let pat = super::super::get_xrandr_conn_pat("HDMI-2");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "HDMI-2 disconnected (normal left inverted right x axis y axis)\n";
+            assert!(re.captures(input).is_none());
+        }
+
+        #[test]
+        fn test_get_xrandr_conn_pat_headless_display() {
+            let pat = super::super::get_xrandr_conn_pat("default");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "default connected 1920x1080+0+0 0mm x 0mm\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1080");
+        }
+
+        #[test]
+        fn test_get_xrandr_conn_pat_xwayland() {
+            let pat = super::super::get_xrandr_conn_pat("XWAYLAND0");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "XWAYLAND0 connected primary 1920x984+0+0 (normal left inverted right x axis y axis) 0mm x 0mm\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "984");
+        }
+
+        #[test]
+        fn test_get_xrandr_conn_pat_rdp() {
+            let pat = super::super::get_xrandr_conn_pat("rdp0");
+            let re = Regex::new(&pat).expect("pattern should compile");
+            let input = "rdp0 connected primary 1920x1080+0+0 0mm x 0mm\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1080");
+        }
+
+        // -----------------------------------------------------------
+        // get_width_height_from_captures() — parsing
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_get_width_height_from_captures_valid() {
+            let re = Regex::new(r"(?P<width>\d+)x(?P<height>\d+)").unwrap();
+            let caps = re.captures("1920x1080").unwrap();
+            let result = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(result, Some((1920, 1080)));
+        }
+
+        #[test]
+        fn test_get_width_height_from_captures_small() {
+            let re = Regex::new(r"(?P<width>\d+)x(?P<height>\d+)").unwrap();
+            let caps = re.captures("800x600").unwrap();
+            let result = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(result, Some((800, 600)));
+        }
+
+        #[test]
+        fn test_get_width_height_from_captures_4k() {
+            let re = Regex::new(r"(?P<width>\d+)x(?P<height>\d+)").unwrap();
+            let caps = re.captures("3840x2160").unwrap();
+            let result = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(result, Some((3840, 2160)));
+        }
+
+        #[test]
+        fn test_get_width_height_from_captures_no_match() {
+            // Use a regex without named groups — captures won't have "width"/"height"
+            let re = Regex::new(r"(\d+)x(\d+)").unwrap();
+            let caps = re.captures("1920x1080").unwrap();
+            let result = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(result, None);
+        }
+
+        // -----------------------------------------------------------
+        // xrandr resolution pattern — end-to-end parsing
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_xrandr_resolution_pattern() {
+            let resolution_pat =
+                r"\s*(?P<width>\d+)x(?P<height>\d+)\s+(?P<rates>(\d+\.\d+\D*)+)\s*\n";
+            let re = Regex::new(resolution_pat).unwrap();
+
+            let input = " 1920x1080 60.01*+ 60.01 59.97 59.96 59.93\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1080");
+        }
+
+        #[test]
+        fn test_xrandr_resolution_pattern_single_rate() {
+            let resolution_pat =
+                r"\s*(?P<width>\d+)x(?P<height>\d+)\s+(?P<rates>(\d+\.\d+\D*)+)\s*\n";
+            let re = Regex::new(resolution_pat).unwrap();
+
+            let input = " 1920x1080 10.00*\n";
+            let caps = re.captures(input).expect("should match");
+            assert_eq!(caps.name("width").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("height").unwrap().as_str(), "1080");
+        }
+
+        #[test]
+        fn test_xrandr_resolution_pattern_multiple_resolutions() {
+            let resolution_pat =
+                r"\s*(?P<width>\d+)x(?P<height>\d+)\s+(?P<rates>(\d+\.\d+\D*)+)\s*\n";
+            let re = Regex::new(resolution_pat).unwrap();
+
+            let input = " 1920x1080 60.01*+  60.01    59.97    59.96    59.93\n 1680x1050 59.95    59.88\n 1600x1024 60.17\n";
+            let matches: Vec<_> = re.captures_iter(input).collect();
+            assert_eq!(matches.len(), 3);
+            assert_eq!(matches[0].name("width").unwrap().as_str(), "1920");
+            assert_eq!(matches[0].name("height").unwrap().as_str(), "1080");
+            assert_eq!(matches[1].name("width").unwrap().as_str(), "1680");
+            assert_eq!(matches[1].name("height").unwrap().as_str(), "1050");
+            assert_eq!(matches[2].name("width").unwrap().as_str(), "1600");
+            assert_eq!(matches[2].name("height").unwrap().as_str(), "1024");
+        }
+
+        // -----------------------------------------------------------
+        // line_values() logic — hbb_common private, verified via
+        // replicated logic to ensure our understanding is correct
+        // -----------------------------------------------------------
+
+        /// Replicates hbb_common's line_values for testing the parsing logic
+        fn line_values_local(indices: &[usize], line: &str) -> Vec<String> {
+            indices
+                .iter()
+                .map(|idx| line.split_whitespace().nth(*idx).unwrap_or("").to_owned())
+                .collect::<Vec<String>>()
+        }
+
+        #[test]
+        fn test_line_values_typical_loginctl_line() {
+            let line = "  c2   1000 alice seat0 tty2";
+            let result = line_values_local(&[0, 1, 2], line);
+            assert_eq!(result, vec!["c2", "1000", "alice"]);
+        }
+
+        #[test]
+        fn test_line_values_empty_line() {
+            let result = line_values_local(&[0, 1, 2], "");
+            assert_eq!(result, vec!["", "", ""]);
+        }
+
+        #[test]
+        fn test_line_values_single_index() {
+            let line = "c2 1000 alice seat0";
+            let result = line_values_local(&[2], line);
+            assert_eq!(result, vec!["alice"]);
+        }
+
+        #[test]
+        fn test_line_values_out_of_range() {
+            let line = "c2 1000";
+            let result = line_values_local(&[0, 1, 5], line);
+            assert_eq!(result, vec!["c2", "1000", ""]);
+        }
+
+        // -----------------------------------------------------------
+        // ignore_loginctl_line() logic — hbb_common private,
+        // verified via replicated logic
+        // -----------------------------------------------------------
+
+        /// Replicates hbb_common's ignore_loginctl_line for testing
+        fn ignore_loginctl_line_local(line: &str) -> bool {
+            line.contains("sessions") || line.split(" ").count() < 4
+        }
+
+        #[test]
+        fn test_ignore_loginctl_line_sessions_listed() {
+            assert!(ignore_loginctl_line_local("3 sessions listed."));
+        }
+
+        #[test]
+        fn test_ignore_loginctl_line_too_few_fields() {
+            assert!(ignore_loginctl_line_local("c2 1000"));
+            assert!(ignore_loginctl_line_local("just-one"));
+        }
+
+        #[test]
+        fn test_ignore_loginctl_line_valid() {
+            assert!(!ignore_loginctl_line_local("c2 1000 alice seat0"));
+            // Note: split(" ") counts empty strings between consecutive spaces,
+            // so "   c3  1001  bob   seat0  tty3" has many parts and passes
+            assert!(!ignore_loginctl_line_local("   c3  1001  bob   seat0  tty3"));
+        }
+
+        // -----------------------------------------------------------
+        // get_env_var()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_get_env_var_existing() {
+            std::env::set_var("__RUSTDESK_TEST_VAR_987", "hello");
+            assert_eq!(super::super::get_env_var("__RUSTDESK_TEST_VAR_987"), "hello");
+            std::env::remove_var("__RUSTDESK_TEST_VAR_987");
+        }
+
+        #[test]
+        fn test_get_env_var_missing() {
+            std::env::remove_var("__RUSTDESK_TEST_NONEXISTENT_VAR_XYZ");
+            assert_eq!(
+                super::super::get_env_var("__RUSTDESK_TEST_NONEXISTENT_VAR_XYZ"),
+                ""
+            );
+        }
+
+        // -----------------------------------------------------------
+        // clip_cursor() — always returns true (no-op on Linux)
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_clip_cursor_none() {
+            assert!(super::super::clip_cursor(None));
+        }
+
+        #[test]
+        fn test_clip_cursor_some() {
+            assert!(super::super::clip_cursor(Some((0, 0, 1920, 1080))));
+        }
+
+        // -----------------------------------------------------------
+        // Desktop constants
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_module_constants() {
+            assert_eq!(XFCE4_PANEL, "xfce4-panel");
+            assert_eq!(SDDM_GREETER, "sddm-greeter");
+            assert_eq!(DISPLAY_SERVER_WAYLAND, "wayland");
+            assert_eq!(DISPLAY_SERVER_X11, "x11");
+        }
+
+        // -----------------------------------------------------------
+        // is_headless_allowed()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_is_headless_allowed_default() {
+            // By default, the option is empty, so headless is not allowed.
+            // We don't modify global config, just check the current state is consistent.
+            let option_val =
+                hbb_common::config::Config::get_option(hbb_common::config::keys::OPTION_ALLOW_LINUX_HEADLESS);
+            let expected = option_val == "Y";
+            assert_eq!(super::super::is_headless_allowed(), expected);
+        }
+
+        // -----------------------------------------------------------
+        // DISPLAY_SERVER constants and is_desktop_wayland / is_x11_or_headless
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_display_server_constants() {
+            assert_eq!(DISPLAY_SERVER_WAYLAND, "wayland");
+            assert_eq!(DISPLAY_SERVER_X11, "x11");
+            // These are complementary checks
+            assert_ne!(DISPLAY_SERVER_WAYLAND, DISPLAY_SERVER_X11);
+        }
+
+        // -----------------------------------------------------------
+        // Desktop combinations: is_login_wayland + is_headless
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_login_wayland_is_also_headless_when_no_sid() {
+            let d = Desktop {
+                username: "gdm".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                sid: "".to_string(),
+                ..Default::default()
+            };
+            assert!(d.is_login_wayland());
+            assert!(d.is_headless());
+        }
+
+        #[test]
+        fn test_desktop_login_wayland_not_headless_with_sid() {
+            let d = Desktop {
+                username: "gdm".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                sid: "c1".to_string(),
+                ..Default::default()
+            };
+            assert!(d.is_login_wayland());
+            assert!(!d.is_headless());
+        }
+
+        // -----------------------------------------------------------
+        // shell_quote() — re-exported from hbb_common
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_shell_quote_empty() {
+            assert_eq!(shell_quote(""), "''");
+        }
+
+        #[test]
+        fn test_shell_quote_path_with_spaces() {
+            assert_eq!(
+                shell_quote("/opt/my app/bin"),
+                "'/opt/my app/bin'"
+            );
+        }
+
+        #[test]
+        fn test_shell_quote_with_single_quote() {
+            assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        }
+
+        #[test]
+        fn test_shell_quote_injection_attempt() {
+            // Verify that shell metacharacters are safely quoted.
+            // Just check the output starts and ends with single quotes
+            // and contains the original content (escaped).
+            let result = shell_quote("'; rm -rf /; echo '");
+            assert!(result.starts_with('\''));
+            assert!(result.ends_with('\''));
+            assert!(result.contains("rm -rf"));
+            // The key property: the result should NOT be executable as a
+            // dangerous shell command — the single-quote wrapping prevents it.
+            // Verify no unquoted semicolons by checking the structure.
+            assert_eq!(result.matches("'\\''").count(), 2);
+        }
+
+        // -----------------------------------------------------------
+        // is_login_wayland() (module-level) — regex pattern testing
+        // The function reads files, but we can verify the regex patterns
+        // it uses correctly match expected GDM config content.
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_login_wayland_regex_commented_out_false() {
+            // Pattern: # WaylandEnable = false (commented out means wayland IS enabled)
+            let pat1 = Regex::new(r"# *WaylandEnable *= *false").unwrap();
+            assert!(pat1.is_match("# WaylandEnable = false"));
+            assert!(pat1.is_match("#WaylandEnable=false"));
+            assert!(pat1.is_match("#  WaylandEnable =  false"));
+        }
+
+        #[test]
+        fn test_login_wayland_regex_explicit_true() {
+            let pat2 = Regex::new(r"WaylandEnable *= *true").unwrap();
+            assert!(pat2.is_match("WaylandEnable=true"));
+            assert!(pat2.is_match("WaylandEnable = true"));
+            // Commented-out true should NOT match pat2 by itself, but the
+            // commented-out line would match pat1 only if it says "false".
+            // Let's verify pat2 does NOT match uncommented false:
+            assert!(!pat2.is_match("WaylandEnable=false"));
+        }
+
+        #[test]
+        fn test_login_wayland_regex_disabled() {
+            let pat1 = Regex::new(r"# *WaylandEnable *= *false").unwrap();
+            let pat2 = Regex::new(r"WaylandEnable *= *true").unwrap();
+            // If WaylandEnable=false is uncommented, neither pattern matches
+            let content = "WaylandEnable=false";
+            assert!(!pat1.is_match(content));
+            assert!(!pat2.is_match(content));
+        }
+
+        // -----------------------------------------------------------
+        // is_valid_env_key logic (replicated since it's a nested fn)
+        // -----------------------------------------------------------
+
+        fn is_valid_env_key(key: &str) -> bool {
+            let mut it = key.chars();
+            match it.next() {
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+                _ => return false,
+            }
+            it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+
+        #[test]
+        fn test_is_valid_env_key_valid() {
+            assert!(is_valid_env_key("HOME"));
+            assert!(is_valid_env_key("DISPLAY"));
+            assert!(is_valid_env_key("_PRIVATE"));
+            assert!(is_valid_env_key("XDG_RUNTIME_DIR"));
+            assert!(is_valid_env_key("a"));
+            assert!(is_valid_env_key("_"));
+            assert!(is_valid_env_key("VAR123"));
+        }
+
+        #[test]
+        fn test_is_valid_env_key_invalid() {
+            assert!(!is_valid_env_key(""));
+            assert!(!is_valid_env_key("1VAR"));
+            assert!(!is_valid_env_key("java.home"));
+            assert!(!is_valid_env_key("VAR-NAME"));
+            assert!(!is_valid_env_key("VAR NAME"));
+            assert!(!is_valid_env_key("0"));
+            assert!(!is_valid_env_key(".dotted"));
+        }
+
+        // -----------------------------------------------------------
+        // INVALID_TERM_VALUES constant
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_invalid_term_values() {
+            let vals = super::super::INVALID_TERM_VALUES;
+            assert!(vals.contains(&""));
+            assert!(vals.contains(&"unknown"));
+            assert!(vals.contains(&"dumb"));
+            assert!(!vals.contains(&"xterm"));
+            assert!(!vals.contains(&"xterm-256color"));
+        }
+
+        // -----------------------------------------------------------
+        // Desktop struct with full fields populated
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_desktop_full_state() {
+            let d = Desktop {
+                sid: "c2".to_string(),
+                username: "alice".to_string(),
+                uid: "1000".to_string(),
+                protocol: DISPLAY_SERVER_X11.to_string(),
+                display: ":0".to_string(),
+                xauth: "/home/alice/.Xauthority".to_string(),
+                home: "/home/alice".to_string(),
+                dbus: "unix:path=/run/user/1000/bus".to_string(),
+                is_rustdesk_subprocess: false,
+                wl_display: "".to_string(),
+            };
+            assert!(!d.is_wayland());
+            assert!(!d.is_login_wayland());
+            assert!(!d.is_headless());
+        }
+
+        #[test]
+        fn test_desktop_wayland_session() {
+            let d = Desktop {
+                sid: "c3".to_string(),
+                username: "bob".to_string(),
+                uid: "1001".to_string(),
+                protocol: DISPLAY_SERVER_WAYLAND.to_string(),
+                display: ":0".to_string(),
+                xauth: "".to_string(),
+                home: "/home/bob".to_string(),
+                dbus: "unix:path=/run/user/1001/bus".to_string(),
+                is_rustdesk_subprocess: false,
+                wl_display: "wayland-0".to_string(),
+            };
+            assert!(d.is_wayland());
+            assert!(!d.is_login_wayland());
+            assert!(!d.is_headless());
+        }
+
+        // -----------------------------------------------------------
+        // PA_SAMPLE_RATE constant
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_pa_sample_rate() {
+            assert_eq!(super::super::PA_SAMPLE_RATE, 48000);
+        }
+
+        // -----------------------------------------------------------
+        // is_flatpak() — checks for /.flatpak-info
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_is_flatpak() {
+            // In a normal test environment, /.flatpak-info should not exist
+            let expected = std::path::PathBuf::from("/.flatpak-info").exists();
+            assert_eq!(super::super::is_flatpak(), expected);
+        }
+
+        // -----------------------------------------------------------
+        // xrandr connected pattern + width/height — integrated
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_xrandr_conn_pat_and_width_height_integration() {
+            let pat = super::super::get_xrandr_conn_pat("Virtual1");
+            let re = Regex::new(&pat).unwrap();
+            let input = "Virtual1 connected primary 1920x984+0+0 (normal left inverted right x axis y axis) 0mm x 0mm\n";
+            let caps = re.captures(input).unwrap();
+            let wh = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(wh, Some((1920, 984)));
+        }
+
+        #[test]
+        fn test_xrandr_conn_pat_with_offset() {
+            let pat = super::super::get_xrandr_conn_pat("DP-1");
+            let re = Regex::new(&pat).unwrap();
+            let input = "DP-1 connected 2560x1440+1920+360 (normal left inverted right x axis y axis) 597mm x 336mm\n";
+            let caps = re.captures(input).unwrap();
+            assert_eq!(caps.name("x").unwrap().as_str(), "1920");
+            assert_eq!(caps.name("y").unwrap().as_str(), "360");
+            let wh = super::super::get_width_height_from_captures(&caps);
+            assert_eq!(wh, Some((2560, 1440)));
+        }
+
+        // -----------------------------------------------------------
+        // ignore_loginctl_line: edge cases
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_ignore_loginctl_line_empty() {
+            assert!(ignore_loginctl_line_local(""));
+        }
+
+        #[test]
+        fn test_ignore_loginctl_line_exactly_four_fields() {
+            assert!(!ignore_loginctl_line_local("a b c d"));
+        }
+
+        #[test]
+        fn test_ignore_loginctl_line_sessions_word_in_data() {
+            assert!(ignore_loginctl_line_local("3 sessions listed."));
+            assert!(ignore_loginctl_line_local("sessions are active on this machine"));
+        }
     }
 }
 

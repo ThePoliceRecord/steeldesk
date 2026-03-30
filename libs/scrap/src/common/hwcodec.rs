@@ -6,6 +6,7 @@ use crate::{
 use hbb_common::{
     anyhow::{anyhow, bail, Context},
     bytes::Bytes,
+    config::Config,
     log,
     message_proto::{EncodedVideoFrame, EncodedVideoFrames, VideoFrame},
     serde_derive::{Deserialize, Serialize},
@@ -29,14 +30,43 @@ const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
+/// Quality preset used when low-latency mode is enabled. Maps to the fastest
+/// encoder preset for each backend:
+///   NVENC: preset p1 (+ tune=ull ideally), QSV: veryfast, AMF: speed
+/// The hwcodec crate's C++ `set_quality()` is currently commented out in
+/// `ffmpeg_ram_encode.cpp`, so this value is stored but not yet applied.
+// TODO: hwcodec crate needs to un-comment set_quality() and add NVENC tune=ull support
+const LOW_LATENCY_HW_QUALITY: Quality = Quality_Low;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
 
 crate::generate_call_macro!(call_yuv, false);
+
+/// Check whether low-latency mode is enabled via the config option.
+/// When enabled, the hardware encoder uses the fastest quality preset
+/// to minimize encoding latency at the cost of visual quality.
+pub fn is_low_latency_mode() -> bool {
+    Config::get_option("low-latency-mode") == "Y"
+}
 
 #[cfg(not(target_os = "android"))]
 lazy_static::lazy_static! {
     static ref CONFIG: std::sync::Arc<std::sync::Mutex<Option<HwCodecConfig>>> = Default::default();
     static ref CONFIG_SET_BY_IPC: std::sync::Arc<std::sync::Mutex<bool>> = Default::default();
+}
+
+const MIN_FPS: i32 = 1;
+const MAX_FPS: i32 = 240;
+
+/// Clamp FPS to the valid range [1, 240].
+/// Returns DEFAULT_FPS for values <= 0, and caps at MAX_FPS.
+pub fn clamp_fps(fps: i32) -> i32 {
+    if fps <= 0 {
+        DEFAULT_FPS
+    } else if fps > MAX_FPS {
+        MAX_FPS
+    } else {
+        fps
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +77,8 @@ pub struct HwRamEncoderConfig {
     pub height: usize,
     pub quality: f32,
     pub keyframe_interval: Option<usize>,
+    /// Target FPS for the hardware encoder. If None, defaults to DEFAULT_FPS (30).
+    pub fps: Option<i32>,
 }
 
 pub struct HwRamEncoder {
@@ -69,6 +101,23 @@ impl EncoderApi for HwRamEncoder {
                     Self::bitrate(&config.name, config.width, config.height, config.quality);
                 bitrate = Self::check_bitrate_range(&config, bitrate);
                 let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
+                let fps = clamp_fps(config.fps.unwrap_or(DEFAULT_FPS));
+                // When low-latency mode is active, select the fastest quality
+                // preset to minimize encode latency. The gop stays at
+                // DEFAULT_GOP (i32::MAX) to avoid unnecessary keyframes.
+                // NVENC: tune=ull, QSV: low_latency=1, VAAPI: low_power if supported
+                // TODO: hwcodec crate needs low-latency preset support
+                //   - The C++ set_quality() in ffmpeg_ram_encode.cpp is
+                //     commented out; once enabled, Quality_Low maps to:
+                //     NVENC preset p1, QSV veryfast, AMF speed.
+                //   - For full ultra-low-latency, hwcodec should also set
+                //     NVENC tune=ull and QSV low_latency=1.
+                let quality = if is_low_latency_mode() {
+                    log::info!("HW encoder: low-latency mode enabled, using fastest quality preset");
+                    LOW_LATENCY_HW_QUALITY
+                } else {
+                    DEFAULT_HW_QUALITY
+                };
                 let ctx = EncodeContext {
                     name: config.name.clone(),
                     mc_name: config.mc_name.clone(),
@@ -77,9 +126,9 @@ impl EncoderApi for HwRamEncoder {
                     pixfmt: DEFAULT_PIXFMT,
                     align: HW_STRIDE_ALIGN as _,
                     kbs: bitrate as i32,
-                    fps: DEFAULT_FPS,
+                    fps,
                     gop,
-                    quality: DEFAULT_HW_QUALITY,
+                    quality,
                     rc,
                     q: -1,
                     thread_count: codec_thread_num(16) as _, // ffmpeg's thread_count is used for cpu
@@ -760,4 +809,108 @@ pub fn start_check_process() {
     ONCE.call_once(|| {
         std::thread::spawn(f);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fps_is_30() {
+        assert_eq!(DEFAULT_FPS, 30);
+    }
+
+    #[test]
+    fn clamp_fps_normal_values() {
+        assert_eq!(clamp_fps(1), 1);
+        assert_eq!(clamp_fps(30), 30);
+        assert_eq!(clamp_fps(60), 60);
+        assert_eq!(clamp_fps(120), 120);
+        assert_eq!(clamp_fps(240), 240);
+    }
+
+    #[test]
+    fn clamp_fps_zero_returns_default() {
+        assert_eq!(clamp_fps(0), DEFAULT_FPS);
+    }
+
+    #[test]
+    fn clamp_fps_negative_returns_default() {
+        assert_eq!(clamp_fps(-1), DEFAULT_FPS);
+        assert_eq!(clamp_fps(-100), DEFAULT_FPS);
+        assert_eq!(clamp_fps(i32::MIN), DEFAULT_FPS);
+    }
+
+    #[test]
+    fn clamp_fps_above_max_is_capped() {
+        assert_eq!(clamp_fps(241), MAX_FPS);
+        assert_eq!(clamp_fps(1000), MAX_FPS);
+        assert_eq!(clamp_fps(i32::MAX), MAX_FPS);
+    }
+
+    #[test]
+    fn encoder_config_fps_none_uses_default() {
+        let config = HwRamEncoderConfig {
+            name: "test".to_string(),
+            mc_name: None,
+            width: 1920,
+            height: 1080,
+            quality: 1.0,
+            keyframe_interval: None,
+            fps: None,
+        };
+        let fps = clamp_fps(config.fps.unwrap_or(DEFAULT_FPS));
+        assert_eq!(fps, DEFAULT_FPS);
+    }
+
+    #[test]
+    fn encoder_config_fps_some_60() {
+        let config = HwRamEncoderConfig {
+            name: "test".to_string(),
+            mc_name: None,
+            width: 1920,
+            height: 1080,
+            quality: 1.0,
+            keyframe_interval: None,
+            fps: Some(60),
+        };
+        let fps = clamp_fps(config.fps.unwrap_or(DEFAULT_FPS));
+        assert_eq!(fps, 60);
+    }
+
+    #[test]
+    fn encoder_config_fps_some_invalid_clamped() {
+        let config = HwRamEncoderConfig {
+            name: "test".to_string(),
+            mc_name: None,
+            width: 1920,
+            height: 1080,
+            quality: 1.0,
+            keyframe_interval: None,
+            fps: Some(500),
+        };
+        let fps = clamp_fps(config.fps.unwrap_or(DEFAULT_FPS));
+        assert_eq!(fps, MAX_FPS);
+    }
+
+    #[test]
+    fn low_latency_quality_is_quality_low() {
+        assert_eq!(LOW_LATENCY_HW_QUALITY, Quality_Low);
+    }
+
+    #[test]
+    fn default_quality_is_quality_default() {
+        assert_eq!(DEFAULT_HW_QUALITY, Quality_Default);
+    }
+
+    #[test]
+    fn low_latency_quality_differs_from_default() {
+        assert_ne!(LOW_LATENCY_HW_QUALITY, DEFAULT_HW_QUALITY);
+    }
+
+    #[test]
+    fn is_low_latency_mode_returns_false_by_default() {
+        // Config::get_option returns "" for unset options, which is not "Y"
+        assert!(!is_low_latency_mode());
+    }
 }

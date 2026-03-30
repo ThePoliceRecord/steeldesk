@@ -48,6 +48,8 @@ pub(crate) mod wayland;
 pub mod uinput;
 #[cfg(target_os = "linux")]
 pub mod rdp_input;
+#[cfg(all(target_os = "linux", feature = "libei"))]
+pub mod ei_input;
 #[cfg(target_os = "linux")]
 pub mod dbus;
 #[cfg(not(target_os = "android"))]
@@ -68,10 +70,12 @@ pub mod input_service {
 
 mod connection;
 pub mod display_service;
+pub mod gpu_pipeline;
 #[cfg(windows)]
 pub mod portable_service;
 mod service;
-mod video_qos;
+pub mod video_qos;
+pub mod frame_buffer;
 pub mod video_service;
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]

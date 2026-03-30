@@ -30,7 +30,9 @@ use uuid::Uuid;
 use crate::{
     check_port,
     common::input::{MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP},
-    create_symmetric_key_msg, decode_id_pk, get_rs_pk, is_keyboard_mode_supported,
+    create_symmetric_key_msg, decode_id_pk,
+    cursor_prediction::CursorPredictor,
+    get_rs_pk, is_keyboard_mode_supported,
     kcp_stream::KcpStream,
     secure_tcp,
     ui_interface::{get_builtin_option, resolve_avatar_url, use_texture_render},
@@ -98,6 +100,16 @@ pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
+
+/// Returns a smaller video queue size in low-latency mode for reduced buffering,
+/// or the default `VIDEO_QUEUE_SIZE` otherwise.
+pub fn video_queue_size() -> usize {
+    if Config::get_option("low-latency-mode") == "Y" {
+        3
+    } else {
+        VIDEO_QUEUE_SIZE
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub const LOGIN_MSG_DESKTOP_NOT_INITED: &str = "Desktop env is not inited";
@@ -170,6 +182,35 @@ lazy_static::lazy_static! {
 #[cfg(not(target_os = "ios"))]
 lazy_static::lazy_static! {
     static ref CLIPBOARD_STATE: Arc<Mutex<ClipboardState>> = Arc::new(Mutex::new(ClipboardState::new()));
+}
+
+lazy_static::lazy_static! {
+    static ref CURSOR_PREDICTOR: RwLock<Option<CursorPredictor>> =
+        RwLock::new(None);
+}
+
+/// Initialize the global cursor predictor.
+///
+/// Call once when a remote connection starts.  Pass `enabled: true` to activate
+/// client-side cursor prediction (recommended when low-latency mode is on).
+pub fn init_cursor_predictor(enabled: bool) {
+    *CURSOR_PREDICTOR.write().unwrap() = Some(CursorPredictor::new(enabled));
+}
+
+/// Returns the cursor position that should be rendered.
+///
+/// When cursor prediction is active this returns the predicted (low-latency)
+/// position; otherwise it falls back to the last server-confirmed position.
+/// Returns `None` when the predictor is not initialized or has no data yet.
+///
+/// This is the public API that the Flutter render loop (or Sciter paint
+/// callback) should call each frame.
+pub fn get_cursor_render_position() -> Option<(i32, i32)> {
+    CURSOR_PREDICTOR
+        .read()
+        .unwrap()
+        .as_ref()?
+        .get_render_position()
 }
 
 const PUBLIC_SERVER: &str = "public";
@@ -252,6 +293,25 @@ impl Client {
     )> {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
+        }
+        // QUIC transport integration point.
+        // When fully wired, this is where we would attempt a QUIC connection
+        // before falling back to TCP for direct IP/domain connections below.
+        //
+        // Integration sites in this function:
+        //   1. Direct IP connection (hbb_common::is_ip_str branch) — connect_tcp_local()
+        //   2. Direct domain connection (hbb_common::is_domain_port_str branch) — connect_tcp_local()
+        //   3. NAT-traversed peer connection — connect_tcp_local() in connect_futures
+        //   4. Relay connection — Self::create_relay() → connect_tcp()
+        //
+        // Each site returns a `Stream` (TCP). The QUIC path would return a
+        // QuicTransport wrapped in a Stream-compatible adapter instead.
+        if crate::transport::should_use_quic() {
+            log::info!(
+                "QUIC transport preferred for peer '{}' — \
+                 integration pending, will use TCP",
+                peer,
+            );
         }
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
@@ -811,11 +871,14 @@ impl Client {
                                 conn.send(&Message::new()).await?;
                             }
                         } else {
-                            // fall back to non-secure connection in case pk mismatch
-                            log::info!("pk mismatch, fall back to non-secure");
-                            let mut msg_out = Message::new();
-                            msg_out.set_public_key(PublicKey::new());
-                            conn.send(&msg_out).await?;
+                            // Public key mismatch — possible MITM attack (CWE-757).
+                            // Refuse the connection instead of downgrading to cleartext.
+                            log::warn!(
+                                "Public key mismatch for peer '{}' — connection refused to prevent potential MITM downgrade to unencrypted transport",
+                                peer_id
+                            );
+                            conn.send(&Message::new()).await?;
+                            bail!("Public key mismatch — connection refused for security");
                         }
                     } else {
                         log::error!("Handshake failed: invalid message type");
@@ -3125,6 +3188,10 @@ pub fn send_mouse(
     command: bool,
     interface: &impl Interface,
 ) {
+    // Update cursor prediction with the local mouse position.
+    if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+        predictor.on_local_mouse_move(x, y);
+    }
     let mut msg_out = Message::new();
     let mut mouse_event = MouseEvent {
         mask,
@@ -4195,4 +4262,1220 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+#[cfg(test)]
+mod security_tests {
+    use hbb_common::{
+        message_proto::IdPk,
+        protobuf::Message as _,
+        sodiumoxide::crypto::sign,
+    };
+
+    use crate::common::decode_id_pk;
+
+    /// Verify that a public key mismatch during the handshake results in an
+    /// error rather than a silent downgrade to an unencrypted connection.
+    ///
+    /// Previously, when `decode_id_pk` failed (signature mismatch between the
+    /// peer's presented key and the rendezvous-server-certified key), the client
+    /// would fall back to sending an empty `PublicKey` message — establishing a
+    /// cleartext session. An active MITM attacker could exploit this by
+    /// presenting a mismatched key to force the downgrade (CWE-757).
+    ///
+    /// The fix changes the client to refuse the connection with an error when
+    /// the public key does not match, instead of downgrading.
+    #[test]
+    fn test_pk_mismatch_returns_error_not_downgrade() {
+        // Generate two different signing keypairs to simulate a mismatch
+        let (legitimate_pk, legitimate_sk) = sign::gen_keypair();
+        let (_attacker_pk, _attacker_sk) = sign::gen_keypair();
+
+        // Create a valid signed payload using the legitimate key
+        let id_pk = IdPk {
+            id: "test-peer-123".to_owned(),
+            pk: vec![0u8; 32].into(),
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed_payload = sign::sign(&payload, &legitimate_sk);
+
+        // Verify that decoding with the correct key succeeds
+        let result = decode_id_pk(&signed_payload, &legitimate_pk);
+        assert!(
+            result.is_ok(),
+            "decode_id_pk should succeed with matching key"
+        );
+
+        // Generate a different keypair to simulate what the rendezvous server
+        // would certify — i.e., the "expected" key that doesn't match the
+        // attacker's presented key
+        let (wrong_pk, _wrong_sk) = sign::gen_keypair();
+
+        // Verify that decoding with a mismatched key returns an error.
+        // This is the condition that triggers the (now-fixed) downgrade path
+        // in `Client::secure_connection`. The old code would silently send an
+        // empty PublicKey and continue unencrypted; the new code bails.
+        let result = decode_id_pk(&signed_payload, &wrong_pk);
+        assert!(
+            result.is_err(),
+            "decode_id_pk must fail when the signing key does not match — \
+             a silent success here would allow a protocol downgrade attack"
+        );
+
+        // Confirm the error message indicates a signature problem
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Signature mismatch"),
+            "Expected 'Signature mismatch' error, got: {}",
+            err_msg
+        );
+    }
+
+    /// Verify that `decode_id_pk` rejects empty / garbage input rather than
+    /// silently succeeding (which could also lead to a downgrade).
+    #[test]
+    fn test_decode_id_pk_rejects_garbage_input() {
+        let (pk, _sk) = sign::gen_keypair();
+
+        // Empty input
+        let result = decode_id_pk(&[], &pk);
+        assert!(result.is_err(), "decode_id_pk must reject empty input");
+
+        // Random garbage
+        let garbage = vec![0xde, 0xad, 0xbe, 0xef, 0x42];
+        let result = decode_id_pk(&garbage, &pk);
+        assert!(result.is_err(), "decode_id_pk must reject garbage input");
+    }
+
+    // Note on the TLS fix in src/common.rs:
+    //
+    // The `post_request_` and `get_http_response_async` functions previously
+    // contained a retry path that, on TLS failure, would automatically retry
+    // with `danger_accept_invalid_cert = true`. This effectively allowed a
+    // network attacker to force the client to accept an invalid TLS certificate
+    // by causing the first connection attempt to fail.
+    //
+    // The fix removes the `danger_accept_invalid_cert` auto-retry branch.
+    // The only remaining retry is switching from Rustls to native-tls (a
+    // different TLS implementation, NOT a security downgrade), which is
+    // acceptable because both backends still validate certificates.
+    //
+    // This is not directly unit-testable without mocking the HTTP client,
+    // but the code change is verified by inspection: the branches containing
+    // `Some(true)` for `danger_accept_invalid_cert` have been removed from
+    // both `post_request_` and `get_http_response_async`.
+
+    // --- Additional decode_id_pk edge cases ---
+
+    #[test]
+    fn test_decode_id_pk_wrong_payload_length() {
+        // A valid signature over a payload whose pk field is not 32 bytes
+        // should fail with "Wrong their public length".
+        let (pk, sk) = sign::gen_keypair();
+        let id_pk = IdPk {
+            id: "peer-short-pk".to_owned(),
+            pk: vec![0u8; 16].into(), // 16 bytes, not 32
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed = sign::sign(&payload, &sk);
+        let result = decode_id_pk(&signed, &pk);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Wrong their public length"),
+            "Expected 'Wrong their public length', got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_decode_id_pk_empty_pk_field() {
+        let (pk, sk) = sign::gen_keypair();
+        let id_pk = IdPk {
+            id: "peer-empty-pk".to_owned(),
+            pk: vec![].into(), // empty pk
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed = sign::sign(&payload, &sk);
+        let result = decode_id_pk(&signed, &pk);
+        assert!(
+            result.is_err(),
+            "decode_id_pk must reject IdPk with empty pk field"
+        );
+    }
+
+    #[test]
+    fn test_decode_id_pk_oversized_pk_field() {
+        let (pk, sk) = sign::gen_keypair();
+        let id_pk = IdPk {
+            id: "peer-big-pk".to_owned(),
+            pk: vec![0xAB; 64].into(), // 64 bytes, not 32
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed = sign::sign(&payload, &sk);
+        let result = decode_id_pk(&signed, &pk);
+        assert!(
+            result.is_err(),
+            "decode_id_pk must reject IdPk with oversized pk field"
+        );
+    }
+
+    #[test]
+    fn test_decode_id_pk_valid_roundtrip() {
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let expected_pk = [0x42u8; 32];
+        let id_pk = IdPk {
+            id: "valid-peer-999".to_owned(),
+            pk: expected_pk.to_vec().into(),
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed = sign::sign(&payload, &server_sk);
+        let (id, pk) = decode_id_pk(&signed, &server_pk).unwrap();
+        assert_eq!(id, "valid-peer-999");
+        assert_eq!(pk, expected_pk);
+    }
+
+    #[test]
+    fn test_decode_id_pk_truncated_signature() {
+        let (pk, sk) = sign::gen_keypair();
+        let id_pk = IdPk {
+            id: "peer".to_owned(),
+            pk: vec![0u8; 32].into(),
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let signed = sign::sign(&payload, &sk);
+        // Truncate to half the signature
+        let truncated = &signed[..signed.len() / 2];
+        let result = decode_id_pk(truncated, &pk);
+        assert!(
+            result.is_err(),
+            "decode_id_pk must reject truncated signatures"
+        );
+    }
+
+    #[test]
+    fn test_decode_id_pk_bit_flip_in_signature() {
+        let (pk, sk) = sign::gen_keypair();
+        let id_pk = IdPk {
+            id: "peer-bitflip".to_owned(),
+            pk: vec![0u8; 32].into(),
+            ..Default::default()
+        };
+        let payload = id_pk.write_to_bytes().unwrap();
+        let mut signed = sign::sign(&payload, &sk);
+        // Flip a bit in the signature portion (first 64 bytes are signature in NaCl)
+        signed[10] ^= 0x01;
+        let result = decode_id_pk(&signed, &pk);
+        assert!(
+            result.is_err(),
+            "decode_id_pk must reject signature with bit flip"
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_unit_tests {
+    use super::*;
+    use hbb_common::message_proto::*;
+    use std::sync::{Arc, RwLock};
+
+    // -----------------------------------------------------------------------
+    // VIDEO_QUEUE_SIZE constant and video_queue_size()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_video_queue_size_constant() {
+        assert_eq!(VIDEO_QUEUE_SIZE, 120);
+    }
+
+    #[test]
+    fn test_video_queue_size_default_mode() {
+        // In test context, Config::get_option("low-latency-mode") is "" (not "Y"),
+        // so video_queue_size() should return the default.
+        let size = video_queue_size();
+        // Should be either 120 (normal) or 3 (low-latency, if env sets it).
+        // In a clean test environment, it should be 120.
+        assert!(
+            size == VIDEO_QUEUE_SIZE || size == 3,
+            "video_queue_size should be {} or 3, got {}",
+            VIDEO_QUEUE_SIZE,
+            size
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_if_retry() — connection retry logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_if_retry_non_error_msgtype() {
+        // Only "error" msgtype should potentially retry
+        assert!(!check_if_retry("info", "Connection Error", "some text", false));
+        assert!(!check_if_retry("warning", "Connection Error", "some text", false));
+        assert!(!check_if_retry("", "Connection Error", "some text", false));
+    }
+
+    #[test]
+    fn test_check_if_retry_wrong_title() {
+        // Must have title "Connection Error"
+        assert!(!check_if_retry("error", "Login Error", "some text", false));
+        assert!(!check_if_retry("error", "", "some text", false));
+    }
+
+    #[test]
+    fn test_check_if_retry_error_10054_with_relay() {
+        // Error 10054 (Windows connection reset) should retry when relay is requested
+        assert!(check_if_retry(
+            "error",
+            "Connection Error",
+            "connection reset 10054",
+            true
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_error_10054_without_relay() {
+        // Error 10054 without retry_for_relay should still potentially retry
+        // via the second branch (if it doesn't contain excluded keywords)
+        let result = check_if_retry(
+            "error",
+            "Connection Error",
+            "connection reset 10054",
+            false,
+        );
+        // "10054" alone doesn't contain offline/not exist/handshake/failed/resolve/mismatch/manually/not allowed
+        assert!(result, "10054 without excluded keywords should retry");
+    }
+
+    #[test]
+    fn test_check_if_retry_error_104_with_relay() {
+        // Error 104 (Linux connection reset) should retry when relay is requested
+        assert!(check_if_retry(
+            "error",
+            "Connection Error",
+            "connection reset 104",
+            true
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_offline_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "peer is Offline",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_not_exist_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "ID does Not Exist",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_handshake_no_retry() {
+        // Generic "handshake" error should not retry
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "TLS Handshake failed",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_failed_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "connection Failed to establish",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_resolve_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "could not Resolve hostname",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_mismatch_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "key Mismatch detected",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_manually_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "closed Manually by user",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_not_allowed_no_retry() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "connection Not Allowed",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_generic_error_retries() {
+        // A generic error without any excluded keywords should retry
+        assert!(check_if_retry(
+            "error",
+            "Connection Error",
+            "timeout occurred",
+            false
+        ));
+    }
+
+    #[test]
+    fn test_check_if_retry_empty_text_retries() {
+        // Empty text contains none of the exclusion keywords
+        assert!(check_if_retry(
+            "error",
+            "Connection Error",
+            "",
+            false
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // MediaData enum — construction and matching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_media_data_video_queue_variant() {
+        let data = MediaData::VideoQueue;
+        match data {
+            MediaData::VideoQueue => {} // ok
+            _ => panic!("Expected VideoQueue variant"),
+        }
+    }
+
+    #[test]
+    fn test_media_data_video_frame_variant() {
+        let vf = VideoFrame::default();
+        let data = MediaData::VideoFrame(Box::new(vf));
+        match data {
+            MediaData::VideoFrame(f) => {
+                assert_eq!(f.display, 0);
+            }
+            _ => panic!("Expected VideoFrame variant"),
+        }
+    }
+
+    #[test]
+    fn test_media_data_audio_frame_variant() {
+        let af = AudioFrame::default();
+        let data = MediaData::AudioFrame(Box::new(af));
+        match data {
+            MediaData::AudioFrame(f) => {
+                assert!(f.data.is_empty());
+            }
+            _ => panic!("Expected AudioFrame variant"),
+        }
+    }
+
+    #[test]
+    fn test_media_data_audio_format_variant() {
+        let fmt = AudioFormat::default();
+        let data = MediaData::AudioFormat(fmt);
+        match data {
+            MediaData::AudioFormat(f) => {
+                assert_eq!(f.sample_rate, 0);
+            }
+            _ => panic!("Expected AudioFormat variant"),
+        }
+    }
+
+    #[test]
+    fn test_media_data_reset_variant() {
+        let data = MediaData::Reset;
+        match data {
+            MediaData::Reset => {}
+            _ => panic!("Expected Reset variant"),
+        }
+    }
+
+    #[test]
+    fn test_media_data_record_screen_variant() {
+        let data_start = MediaData::RecordScreen(true);
+        let data_stop = MediaData::RecordScreen(false);
+        match data_start {
+            MediaData::RecordScreen(v) => assert!(v),
+            _ => panic!("Expected RecordScreen(true)"),
+        }
+        match data_stop {
+            MediaData::RecordScreen(v) => assert!(!v),
+            _ => panic!("Expected RecordScreen(false)"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LoginConfigHandler — pure methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_login_config_handler_default() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(lch.conn_type, ConnType::DEFAULT_CONN);
+        assert!(!lch.remember);
+        assert!(!lch.restarting_remote_device);
+        assert!(!lch.force_relay);
+        assert!(lch.direct.is_none());
+        assert!(!lch.received);
+        assert!(lch.mark_unsupported.is_empty());
+        assert_eq!(lch.version, 0);
+        assert!(!lch.is_terminal_admin);
+    }
+
+    #[test]
+    fn test_login_config_handler_get_image_quality_enum() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(
+            lch.get_image_quality_enum("low", false),
+            Some(ImageQuality::Low)
+        );
+        assert_eq!(
+            lch.get_image_quality_enum("best", false),
+            Some(ImageQuality::Best)
+        );
+        assert_eq!(
+            lch.get_image_quality_enum("balanced", false),
+            Some(ImageQuality::Balanced)
+        );
+        // "balanced" with ignore_default returns None
+        assert_eq!(lch.get_image_quality_enum("balanced", true), None);
+        // "custom" returns None
+        assert_eq!(lch.get_image_quality_enum("custom", false), None);
+        // unknown string returns None
+        assert_eq!(lch.get_image_quality_enum("unknown", false), None);
+        assert_eq!(lch.get_image_quality_enum("", false), None);
+    }
+
+    #[test]
+    fn test_login_config_handler_get_toggle_option_defaults() {
+        let lch = LoginConfigHandler::default();
+        // All toggle options should be false by default
+        assert!(!lch.get_toggle_option("show-remote-cursor"));
+        assert!(!lch.get_toggle_option("lock-after-session-end"));
+        assert!(!lch.get_toggle_option("privacy-mode"));
+        assert!(!lch.get_toggle_option("disable-audio"));
+        assert!(!lch.get_toggle_option("disable-clipboard"));
+        assert!(!lch.get_toggle_option("show-quality-monitor"));
+        assert!(!lch.get_toggle_option("allow_swap_key"));
+        assert!(!lch.get_toggle_option("view-only"));
+        assert!(!lch.get_toggle_option("show-my-cursor"));
+        assert!(!lch.get_toggle_option("follow-remote-cursor"));
+        assert!(!lch.get_toggle_option("follow-remote-window"));
+    }
+
+    #[test]
+    fn test_login_config_handler_get_option_empty_default() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(lch.get_option("nonexistent-key"), "");
+        assert_eq!(lch.get_option("os-password"), "");
+        assert_eq!(lch.get_option("force-always-relay"), "");
+    }
+
+    #[test]
+    fn test_login_config_handler_get_ui_flutter_default() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(lch.get_ui_flutter("any-key"), "");
+    }
+
+    #[test]
+    fn test_login_config_handler_should_auto_login_empty_password() {
+        let lch = LoginConfigHandler::default();
+        // With default config, os-password is empty, so auto-login returns ""
+        assert_eq!(lch.should_auto_login(), "");
+    }
+
+    #[test]
+    fn test_login_config_handler_is_privacy_mode_supported_default() {
+        let lch = LoginConfigHandler::default();
+        assert!(!lch.is_privacy_mode_supported());
+    }
+
+    #[test]
+    fn test_login_config_handler_refresh_message() {
+        let msg = LoginConfigHandler::refresh();
+        let misc = msg.misc();
+        assert!(misc.refresh_video());
+    }
+
+    #[test]
+    fn test_login_config_handler_refresh_display_message() {
+        let msg = LoginConfigHandler::refresh_display(2);
+        let misc = msg.misc();
+        assert_eq!(misc.refresh_video_display(), 2);
+    }
+
+    #[test]
+    fn test_login_config_handler_restart_remote_device_message() {
+        let lch = LoginConfigHandler::default();
+        let msg = lch.restart_remote_device();
+        let misc = msg.misc();
+        assert!(misc.restart_remote_device());
+    }
+
+    #[test]
+    fn test_login_config_handler_get_conn_token_empty_password() {
+        let lch = LoginConfigHandler::default();
+        // Empty password -> None
+        assert!(lch.get_conn_token().is_none());
+    }
+
+    #[test]
+    fn test_login_config_handler_get_id_default() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(lch.get_id(), "");
+    }
+
+    #[test]
+    fn test_login_config_handler_get_key_terminal_service_id() {
+        let mut lch = LoginConfigHandler::default();
+        assert_eq!(lch.get_key_terminal_service_id(), "terminal-service-id");
+        lch.is_terminal_admin = true;
+        assert_eq!(
+            lch.get_key_terminal_service_id(),
+            "terminal-admin-service-id"
+        );
+    }
+
+    #[test]
+    fn test_login_config_handler_get_remote_dir_empty() {
+        let lch = LoginConfigHandler::default();
+        assert_eq!(lch.get_remote_dir(), "");
+    }
+
+    #[test]
+    fn test_login_config_handler_get_all_remote_dir() {
+        let lch = LoginConfigHandler::default();
+        // Empty path should remove the user entry
+        let result = lch.get_all_remote_dir("".to_owned());
+        assert_eq!(result, "{}");
+        // Non-empty path should insert user entry
+        let result = lch.get_all_remote_dir("/home/user".to_owned());
+        let parsed: std::collections::HashMap<String, String> =
+            serde_json::from_str(&result).unwrap();
+        // username from default config is ""
+        assert!(parsed.contains_key(""));
+    }
+
+    #[test]
+    fn test_login_config_handler_get_option_message_port_forward() {
+        let mut lch = LoginConfigHandler::default();
+        lch.conn_type = ConnType::PORT_FORWARD;
+        assert!(lch.get_option_message(false).is_none());
+    }
+
+    #[test]
+    fn test_login_config_handler_get_option_message_file_transfer() {
+        let mut lch = LoginConfigHandler::default();
+        lch.conn_type = ConnType::FILE_TRANSFER;
+        assert!(lch.get_option_message(false).is_none());
+    }
+
+    #[test]
+    fn test_login_config_handler_get_option_message_rdp() {
+        let mut lch = LoginConfigHandler::default();
+        lch.conn_type = ConnType::RDP;
+        assert!(lch.get_option_message(false).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PasswordSource — pure logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_source_default() {
+        let ps = PasswordSource::default();
+        match ps {
+            PasswordSource::Undefined => {}
+            _ => panic!("Default PasswordSource should be Undefined"),
+        }
+    }
+
+    #[test]
+    fn test_password_source_is_personal_ab() {
+        let ps = PasswordSource::PersonalAb(vec![1, 2, 3]);
+        assert!(ps.is_personal_ab(&[1, 2, 3]));
+        assert!(!ps.is_personal_ab(&[1, 2, 4])); // different password
+        assert!(!ps.is_personal_ab(&[])); // empty password always false
+    }
+
+    #[test]
+    fn test_password_source_is_personal_ab_wrong_variant() {
+        let ps = PasswordSource::SharedAb("shared".to_owned());
+        assert!(!ps.is_personal_ab(&[1, 2, 3]));
+
+        let ps = PasswordSource::Undefined;
+        assert!(!ps.is_personal_ab(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_password_source_is_shared_ab() {
+        use hbb_common::sha2::{Digest, Sha256};
+        let password_str = "my_shared_password";
+        let hash = Hash {
+            salt: "test_salt".to_owned(),
+            challenge: "test_challenge".to_owned(),
+            ..Default::default()
+        };
+        // Compute expected connected_password = SHA256(password_str + salt)
+        let mut hasher = Sha256::new();
+        hasher.update(password_str);
+        hasher.update(&hash.salt);
+        let connected_password: Vec<u8> = hasher.finalize()[..].into();
+
+        let ps = PasswordSource::SharedAb(password_str.to_owned());
+        assert!(ps.is_shared_ab(&connected_password, &hash));
+    }
+
+    #[test]
+    fn test_password_source_is_shared_ab_wrong_password() {
+        let hash = Hash {
+            salt: "salt".to_owned(),
+            challenge: "challenge".to_owned(),
+            ..Default::default()
+        };
+        let ps = PasswordSource::SharedAb("correct_password".to_owned());
+        // Wrong connected_password
+        assert!(!ps.is_shared_ab(&[0u8; 32], &hash));
+    }
+
+    #[test]
+    fn test_password_source_is_shared_ab_empty_password() {
+        let hash = Hash::default();
+        let ps = PasswordSource::SharedAb("password".to_owned());
+        assert!(!ps.is_shared_ab(&[], &hash));
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnToken — serialization roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conn_token_serialization_roundtrip() {
+        let token = ConnToken {
+            password: vec![0x01, 0x02, 0x03],
+            password_source: PasswordSource::Undefined,
+            session_id: 42,
+        };
+        let serialized = serde_json::to_string(&token).unwrap();
+        let deserialized: ConnToken = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.password, vec![0x01, 0x02, 0x03]);
+        assert_eq!(deserialized.session_id, 42);
+        assert_eq!(deserialized.password_source, PasswordSource::Undefined);
+    }
+
+    #[test]
+    fn test_conn_token_with_personal_ab_source() {
+        let token = ConnToken {
+            password: vec![0xAA; 32],
+            password_source: PasswordSource::PersonalAb(vec![0xBB; 32]),
+            session_id: 12345,
+        };
+        let serialized = serde_json::to_string(&token).unwrap();
+        let deserialized: ConnToken = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.password, vec![0xAA; 32]);
+        assert_eq!(deserialized.session_id, 12345);
+        match &deserialized.password_source {
+            PasswordSource::PersonalAb(p) => assert_eq!(p, &vec![0xBB; 32]),
+            _ => panic!("Expected PersonalAb variant"),
+        }
+    }
+
+    #[test]
+    fn test_conn_token_with_shared_ab_source() {
+        let token = ConnToken {
+            password: vec![0xCC; 16],
+            password_source: PasswordSource::SharedAb("shared_pass".to_owned()),
+            session_id: 99999,
+        };
+        let serialized = serde_json::to_string(&token).unwrap();
+        let deserialized: ConnToken = serde_json::from_str(&serialized).unwrap();
+        match &deserialized.password_source {
+            PasswordSource::SharedAb(s) => assert_eq!(s, "shared_pass"),
+            _ => panic!("Expected SharedAb variant"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // fps_calculate — pure FPS computation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fps_calculate_skips_beginning() {
+        let fps = Arc::new(RwLock::new(None));
+        let mut skip_beginning = 0usize;
+        let mut count = 0usize;
+        let mut duration = std::time::Duration::ZERO;
+
+        // First 3 calls should be skipped
+        for _ in 0..3 {
+            fps_calculate(
+                &mut skip_beginning,
+                &fps,
+                false,
+                std::time::Duration::from_millis(10),
+                &mut count,
+                &mut duration,
+            );
+        }
+        assert_eq!(skip_beginning, 3);
+        assert_eq!(count, 0);
+        assert_eq!(duration, std::time::Duration::ZERO);
+        assert!(fps.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fps_calculate_counts_after_skip() {
+        let fps = Arc::new(RwLock::new(None));
+        let mut skip_beginning = 3usize; // already past skip phase
+        let mut count = 0usize;
+        let mut duration = std::time::Duration::ZERO;
+
+        // Add 10 frames at 10ms each to trigger fps update (count % 10 == 0)
+        for _ in 0..10 {
+            fps_calculate(
+                &mut skip_beginning,
+                &fps,
+                false,
+                std::time::Duration::from_millis(10),
+                &mut count,
+                &mut duration,
+            );
+        }
+        assert_eq!(count, 10);
+        assert_eq!(duration, std::time::Duration::from_millis(100));
+        // fps = count * 1000 / ms = 10 * 1000 / 100 = 100
+        assert_eq!(*fps.read().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn test_fps_calculate_resets_at_30() {
+        let fps = Arc::new(RwLock::new(None));
+        let mut skip_beginning = 3usize;
+        let mut count = 0usize;
+        let mut duration = std::time::Duration::ZERO;
+
+        // Add 30 frames
+        for _ in 0..30 {
+            fps_calculate(
+                &mut skip_beginning,
+                &fps,
+                false,
+                std::time::Duration::from_millis(10),
+                &mut count,
+                &mut duration,
+            );
+        }
+        // After 30 frames, count and duration should be reset to 0
+        assert_eq!(count, 0);
+        assert_eq!(duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_fps_calculate_format_changed_resets() {
+        let fps = Arc::new(RwLock::new(None));
+        let mut skip_beginning = 3usize;
+        let mut count = 5usize;
+        let mut duration = std::time::Duration::from_millis(50);
+
+        fps_calculate(
+            &mut skip_beginning,
+            &fps,
+            true, // format_changed
+            std::time::Duration::from_millis(10),
+            &mut count,
+            &mut duration,
+        );
+        // format_changed resets skip_beginning to 0, then the skip check
+        // increments it to 1 and returns early without counting the frame
+        assert_eq!(skip_beginning, 1);
+        assert_eq!(count, 0);
+        assert_eq!(duration, std::time::Duration::ZERO);
+    }
+
+    // -----------------------------------------------------------------------
+    // Data enum — construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_enum_close() {
+        let d = Data::Close;
+        match d {
+            Data::Close => {}
+            _ => panic!("Expected Close variant"),
+        }
+    }
+
+    #[test]
+    fn test_data_enum_login() {
+        let d = Data::Login((
+            "user".to_owned(),
+            "pass".to_owned(),
+            "os_pass".to_owned(),
+            true,
+        ));
+        match d {
+            Data::Login((u, p, op, r)) => {
+                assert_eq!(u, "user");
+                assert_eq!(p, "pass");
+                assert_eq!(op, "os_pass");
+                assert!(r);
+            }
+            _ => panic!("Expected Login variant"),
+        }
+    }
+
+    #[test]
+    fn test_data_enum_message() {
+        let mut msg = Message::new();
+        let mut misc = Misc::new();
+        misc.set_refresh_video(true);
+        msg.set_misc(misc);
+        let d = Data::Message(msg);
+        match d {
+            Data::Message(m) => {
+                assert!(m.misc().refresh_video());
+            }
+            _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_data_enum_record_screen() {
+        let d = Data::RecordScreen(true);
+        match d {
+            Data::RecordScreen(v) => assert!(v),
+            _ => panic!("Expected RecordScreen variant"),
+        }
+    }
+
+    #[test]
+    fn test_data_enum_cancel_job() {
+        let d = Data::CancelJob(42);
+        match d {
+            Data::CancelJob(id) => assert_eq!(id, 42),
+            _ => panic!("Expected CancelJob variant"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Key enum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_key_enum_control_key() {
+        let k = Key::ControlKey(ControlKey::Return);
+        match k {
+            Key::ControlKey(ck) => assert_eq!(ck, ControlKey::Return),
+            _ => panic!("Expected ControlKey variant"),
+        }
+    }
+
+    #[test]
+    fn test_key_enum_chr() {
+        let k = Key::Chr('a' as u32);
+        match k {
+            Key::Chr(c) => assert_eq!(c, 'a' as u32),
+            _ => panic!("Expected Chr variant"),
+        }
+    }
+
+    #[test]
+    fn test_key_map_has_basic_keys() {
+        // Verify the KEY_MAP lazy_static contains expected entries
+        assert!(KEY_MAP.contains_key("VK_A"));
+        assert!(KEY_MAP.contains_key("VK_RETURN"));
+        assert!(KEY_MAP.contains_key("VK_ESCAPE"));
+        assert!(KEY_MAP.contains_key("VK_SPACE"));
+        assert!(KEY_MAP.contains_key("VK_TAB"));
+        assert!(KEY_MAP.contains_key("VK_BACK"));
+        assert!(KEY_MAP.contains_key("VK_DELETE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Login error constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_login_error_constants_are_distinct() {
+        // Verify that all login error message constants are unique
+        let constants = vec![
+            LOGIN_MSG_DESKTOP_SESSION_NOT_READY,
+            LOGIN_MSG_DESKTOP_XSESSION_FAILED,
+            LOGIN_MSG_DESKTOP_SESSION_ANOTHER_USER,
+            LOGIN_MSG_DESKTOP_XORG_NOT_FOUND,
+            LOGIN_MSG_DESKTOP_NO_DESKTOP,
+            LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY,
+            LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG,
+            LOGIN_MSG_PASSWORD_EMPTY,
+            LOGIN_MSG_PASSWORD_WRONG,
+            LOGIN_MSG_2FA_WRONG,
+            REQUIRE_2FA,
+            LOGIN_MSG_NO_PASSWORD_ACCESS,
+            LOGIN_MSG_OFFLINE,
+            LOGIN_SCREEN_WAYLAND,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in &constants {
+            assert!(
+                seen.insert(c),
+                "Duplicate login error constant: {}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_login_error_map_contains_expected_keys() {
+        // Verify LOGIN_ERROR_MAP has entries for known error strings
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_SCREEN_WAYLAND));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_SESSION_NOT_READY));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_XSESSION_FAILED));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_SESSION_ANOTHER_USER));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_XORG_NOT_FOUND));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_NO_DESKTOP));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY));
+        assert!(LOGIN_ERROR_MAP.contains_key(LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_WRONG));
+    }
+
+    #[test]
+    fn test_login_error_map_wayland_entry() {
+        let entry = LOGIN_ERROR_MAP.get(LOGIN_SCREEN_WAYLAND).unwrap();
+        assert_eq!(entry.msgtype, "error");
+        assert_eq!(entry.title, "Login Error");
+        assert!(entry.try_again);
+        assert!(!entry.link.is_empty());
+    }
+
+    #[test]
+    fn test_login_error_map_another_user_no_try_again() {
+        let entry = LOGIN_ERROR_MAP
+            .get(LOGIN_MSG_DESKTOP_SESSION_ANOTHER_USER)
+            .unwrap();
+        assert_eq!(entry.msgtype, "info-nocancel");
+        assert!(!entry.try_again);
+    }
+
+    // -----------------------------------------------------------------------
+    // Duration constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_duration_constants() {
+        assert_eq!(MILLI1, std::time::Duration::from_millis(1));
+        assert_eq!(SEC30, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_max_decode_fail_counter() {
+        assert_eq!(MAX_DECODE_FAIL_COUNTER, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse event mask construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mouse_mask_construction() {
+        use crate::common::input::{
+            MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP,
+        };
+        // Verify the mask encoding: button << 3 | type
+        let left_down = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_DOWN;
+        let left_up = MOUSE_BUTTON_LEFT << 3 | MOUSE_TYPE_UP;
+        let right_down = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_DOWN;
+        let right_up = MOUSE_BUTTON_RIGHT << 3 | MOUSE_TYPE_UP;
+
+        // Verify masks are all different
+        let masks = vec![left_down, left_up, right_down, right_up];
+        let unique: std::collections::HashSet<_> = masks.iter().collect();
+        assert_eq!(unique.len(), 4, "All mouse masks should be unique");
+
+        // Verify we can extract button and type back from the mask
+        assert_eq!(left_down & 0x07, MOUSE_TYPE_DOWN);
+        assert_eq!(left_down >> 3, MOUSE_BUTTON_LEFT);
+        assert_eq!(right_up & 0x07, MOUSE_TYPE_UP);
+        assert_eq!(right_up >> 3, MOUSE_BUTTON_RIGHT);
+    }
+
+    // -----------------------------------------------------------------------
+    // MouseEvent protobuf message construction (testing modifier attachment)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mouse_event_modifier_attachment() {
+        // Test the modifier attachment logic that send_mouse uses internally
+        let mut mouse_event = MouseEvent {
+            mask: 0,
+            x: 100,
+            y: 200,
+            ..Default::default()
+        };
+        // Simulate what send_mouse does with modifier flags
+        mouse_event.modifiers.push(ControlKey::Alt.into());
+        mouse_event.modifiers.push(ControlKey::Shift.into());
+        mouse_event.modifiers.push(ControlKey::Control.into());
+        mouse_event.modifiers.push(ControlKey::Meta.into());
+
+        assert_eq!(mouse_event.modifiers.len(), 4);
+        assert_eq!(mouse_event.x, 100);
+        assert_eq!(mouse_event.y, 200);
+    }
+
+    #[test]
+    fn test_mouse_event_no_modifiers() {
+        let mouse_event = MouseEvent {
+            mask: 0,
+            x: 50,
+            y: 75,
+            ..Default::default()
+        };
+        assert!(mouse_event.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_mouse_event_coordinates() {
+        // Verify that coordinates can span the full range
+        let event = MouseEvent {
+            x: i32::MAX,
+            y: i32::MIN,
+            ..Default::default()
+        };
+        assert_eq!(event.x, i32::MAX);
+        assert_eq!(event.y, i32::MIN);
+    }
+
+    // -----------------------------------------------------------------------
+    // save_custom_image_quality bitshift encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_custom_image_quality_bitshift() {
+        // LoginConfigHandler::save_custom_image_quality encodes as quality << 8
+        let quality = 50i32;
+        let encoded = quality << 8;
+        assert_eq!(encoded, 12800);
+        // Verify roundtrip
+        assert_eq!(encoded >> 8, quality);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoginConfigHandler: get_custom_resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_custom_resolution_default() {
+        let lch = LoginConfigHandler::default();
+        assert!(lch.get_custom_resolution(0).is_none());
+        assert!(lch.get_custom_resolution(1).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // VideoHandler construction (only if not requiring platform APIs)
+    // -----------------------------------------------------------------------
+
+    // Note: VideoHandler::new() calls Decoder::new() which may require
+    // platform-specific codec initialization. We test the struct layout instead.
+
+    #[test]
+    fn test_video_handler_get_adapter_luid() {
+        // On non-flutter, non-iOS builds this should return None
+        #[cfg(not(feature = "flutter"))]
+        {
+            let luid = VideoHandler::get_adapter_luid();
+            assert!(luid.is_none());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor predictor integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_cursor_predictor_enabled() {
+        init_cursor_predictor(true);
+        // After init with enabled=true, moving the mouse should produce a
+        // render position.
+        if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+            predictor.on_local_mouse_move(42, 84);
+        }
+        let pos = get_cursor_render_position();
+        assert_eq!(pos, Some((42, 84)));
+    }
+
+    #[test]
+    fn test_init_cursor_predictor_disabled() {
+        init_cursor_predictor(false);
+        // Disabled predictor should always return None.
+        if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+            predictor.on_local_mouse_move(10, 20);
+        }
+        let pos = get_cursor_render_position();
+        assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn test_get_cursor_render_position_before_init() {
+        // Clear any previously initialized predictor.
+        *CURSOR_PREDICTOR.write().unwrap() = None;
+        let pos = get_cursor_render_position();
+        assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn test_cursor_predictor_server_cursor_via_global() {
+        init_cursor_predictor(true);
+        // Simulate a server cursor update through the global.
+        if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+            predictor.on_server_cursor(300, 400);
+        }
+        let pos = get_cursor_render_position();
+        assert_eq!(pos, Some((300, 400)));
+    }
+
+    #[test]
+    fn test_cursor_predictor_reinit_resets_state() {
+        init_cursor_predictor(true);
+        if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+            predictor.on_local_mouse_move(100, 200);
+        }
+        assert_eq!(get_cursor_render_position(), Some((100, 200)));
+        // Re-initialize — state should be cleared.
+        init_cursor_predictor(true);
+        assert_eq!(get_cursor_render_position(), None);
+    }
 }

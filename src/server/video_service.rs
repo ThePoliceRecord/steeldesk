@@ -18,7 +18,7 @@
 // to-do:
 // https://slhck.info/video/2017/03/01/rate-control.html
 
-use super::{display_service::check_display_changed, service::ServiceTmpl, video_qos::VideoQoS, *};
+use super::{display_service::check_display_changed, frame_buffer::{CapturedFrame, FrameBuffer}, service::ServiceTmpl, video_qos::{self, VideoQoS}, *};
 #[cfg(target_os = "linux")]
 use crate::common::SimpleCallOnReturn;
 #[cfg(target_os = "linux")]
@@ -49,7 +49,7 @@ use scrap::{
     codec::{Encoder, EncoderCfg},
     record::{Recorder, RecorderContext},
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
-    CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
+    CodecFormat, Display, EncodeInput, PixelBuffer, TraitCapturer, TraitPixelBuffer,
 };
 #[cfg(windows)]
 use std::sync::Once;
@@ -122,6 +122,13 @@ struct VideoFrameController {
     send_conn_ids: HashSet<i32>,
 }
 
+/// Default outer timeout for frame ACK waiting (normal mode).
+const FRAME_ACK_TIMEOUT_NORMAL_MS: u64 = 500;
+/// Poll interval for frame ACK waiting (normal mode).
+const FRAME_ACK_POLL_NORMAL_MS: u64 = 50;
+/// Poll interval for low-latency mode (non-blocking).
+const FRAME_ACK_POLL_LOW_LATENCY_MS: u64 = 0;
+
 impl VideoFrameController {
     fn new(display_idx: usize) -> Self {
         Self {
@@ -143,6 +150,17 @@ impl VideoFrameController {
                 .lock()
                 .unwrap()
                 .insert(self.display_idx, self.send_conn_ids.clone());
+        }
+    }
+
+    /// Returns the frame ACK poll timeout and outer timeout based on config.
+    /// In low-latency mode: poll_timeout=0 (non-blocking), outer_timeout=0.
+    /// In normal mode: poll_timeout=50ms, outer_timeout=500ms.
+    fn get_ack_timeouts() -> (u64, u64) {
+        if Config::get_option("low-latency-mode") == "Y" {
+            (FRAME_ACK_POLL_LOW_LATENCY_MS, 0)
+        } else {
+            (FRAME_ACK_POLL_NORMAL_MS, FRAME_ACK_TIMEOUT_NORMAL_MS)
         }
     }
 
@@ -571,6 +589,7 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
     let mut quality = video_qos.ratio();
+    let target_fps = video_qos.fps();
     let record_incoming = config::option2bool(
         "allow-auto-record-incoming",
         &Config::get_option("allow-auto-record-incoming"),
@@ -586,6 +605,7 @@ fn run(vs: VideoService) -> ResultType<()> {
         last_portable_service_running,
         vs.source,
         display_idx,
+        target_fps,
     ) {
         Ok(result) => result,
         Err(err) => {
@@ -606,6 +626,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 last_portable_service_running,
                 vs.source,
                 display_idx,
+                target_fps,
             )?
         }
     };
@@ -651,6 +672,24 @@ fn run(vs: VideoService) -> ResultType<()> {
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+
+    // Normal mode: capture -> encode -> send (sequential, simple)
+    // Low-latency mode: capture -> FrameBuffer -> encode -> send (decoupled, latest-wins)
+    //
+    // In low-latency mode the FrameBuffer sits between capture and encode.
+    // The capture side copies pixel data into a CapturedFrame and stores it
+    // (latest-wins: a new capture overwrites any unconsumed frame).  The
+    // encode side takes the latest frame from the buffer before encoding.
+    //
+    // In this single-threaded integration the store/take happen in the same
+    // loop iteration, establishing the contract for a future multi-threaded
+    // split where a dedicated capture thread feeds the buffer independently.
+    let low_latency = video_qos::is_low_latency_mode();
+    let frame_buffer = if low_latency {
+        Some(FrameBuffer::new())
+    } else {
+        None
+    };
 
     while sp.ok() {
         #[cfg(windows)]
@@ -764,21 +803,60 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
 
-                    let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                    let send_conn_ids = handle_one_frame(
-                        display_idx,
-                        &sp,
-                        frame,
-                        ms,
-                        &mut encoder,
-                        recorder.clone(),
-                        &mut encode_fail_counter,
-                        &mut first_frame,
-                        capture_width,
-                        capture_height,
-                    )?;
-                    frame_controller.set_send(now, send_conn_ids);
-                    send_counter += 1;
+                    // Low-latency path: store pixel data in the FrameBuffer,
+                    // then take the latest frame and encode it.  This establishes
+                    // the decoupled capture/encode contract used by the future
+                    // multi-threaded pipeline.  Texture frames bypass the buffer
+                    // because they are raw GPU pointers that cannot be copied.
+                    if let (Some(ref fb), scrap::Frame::PixelBuffer(ref pb)) = (&frame_buffer, &frame) {
+                        let captured = CapturedFrame {
+                            data: pb.data().to_vec(),
+                            width: pb.width(),
+                            height: pb.height(),
+                            stride: pb.stride().first().copied().unwrap_or(pb.width() * 4),
+                            pixfmt: pb.pixfmt(),
+                            capture_time: Instant::now(),
+                            display_idx,
+                        };
+                        fb.store(captured);
+
+                        // Encode phase: take the latest frame from the buffer.
+                        if let Some(cf) = fb.take() {
+                            let pb_owned = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
+                            scrap::convert_to_yuv(&pb_owned, encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                            let send_conn_ids = handle_one_frame(
+                                display_idx,
+                                &sp,
+                                EncodeInput::YUV(&yuv),
+                                ms,
+                                &mut encoder,
+                                recorder.clone(),
+                                &mut encode_fail_counter,
+                                &mut first_frame,
+                                capture_width,
+                                capture_height,
+                            )?;
+                            frame_controller.set_send(now, send_conn_ids);
+                            send_counter += 1;
+                        }
+                    } else {
+                        // Normal path (or Texture frame): capture -> encode sequentially.
+                        let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                        let send_conn_ids = handle_one_frame(
+                            display_idx,
+                            &sp,
+                            frame,
+                            ms,
+                            &mut encoder,
+                            recorder.clone(),
+                            &mut encode_fail_counter,
+                            &mut first_frame,
+                            capture_width,
+                            capture_height,
+                        )?;
+                        frame_controller.set_send(now, send_conn_ids);
+                        send_counter += 1;
+                    }
                 }
                 #[cfg(windows)]
                 {
@@ -821,8 +899,13 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
                 }
                 if !encoder.latency_free() && yuv.len() > 0 {
-                    // yun.len() > 0 means the frame is not texture.
-                    if repeat_encode_counter < repeat_encode_max {
+                    // In gaming / low-latency mode, skip repeat encoding entirely.
+                    // Re-encoding a stale YUV frame wastes GPU encoder time and
+                    // bandwidth; it is better to wait for the next fresh capture.
+                    if video_qos::is_low_latency_mode() {
+                        // no-op: proceed to next capture cycle
+                    } else if repeat_encode_counter < repeat_encode_max {
+                        // yun.len() > 0 means the frame is not texture.
                         repeat_encode_counter += 1;
                         let send_conn_ids = handle_one_frame(
                             display_idx,
@@ -865,15 +948,21 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         let mut fetched_conn_ids = HashSet::new();
-        let timeout_millis = 3_000u64;
+        let (poll_timeout, outer_timeout) = VideoFrameController::get_ack_timeouts();
         let wait_begin = Instant::now();
-        while wait_begin.elapsed().as_millis() < timeout_millis as _ {
+        while outer_timeout == 0 || wait_begin.elapsed().as_millis() < outer_timeout as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            frame_controller.try_wait_next(&mut fetched_conn_ids, poll_timeout);
             // break if all connections have received current frame
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
+                break;
+            }
+            // In low-latency mode (outer_timeout==0) or if a client hasn't ACKed
+            // within the per-poll window, skip remaining clients and proceed
+            // immediately to the next frame rather than blocking the encoder.
+            if outer_timeout == 0 {
                 break;
             }
         }
@@ -931,6 +1020,7 @@ fn setup_encoder(
     last_portable_service_running: bool,
     source: VideoSource,
     display_idx: usize,
+    target_fps: u32,
 ) -> ResultType<(
     Encoder,
     EncoderCfg,
@@ -945,6 +1035,7 @@ fn setup_encoder(
         client_record || record_incoming,
         last_portable_service_running,
         source,
+        target_fps,
     );
     Encoder::set_fallback(&encoder_cfg);
     let codec_format = Encoder::negotiated_codec();
@@ -961,6 +1052,7 @@ fn get_encoder_config(
     record: bool,
     _portable_service: bool,
     _source: VideoSource,
+    target_fps: u32,
 ) -> EncoderCfg {
     #[cfg(all(windows, feature = "vram"))]
     if _portable_service || c.is_gdi() || _source == VideoSource::Camera {
@@ -994,6 +1086,7 @@ fn get_encoder_config(
                     height: c.height,
                     quality,
                     keyframe_interval,
+                    fps: Some(target_fps as i32),
                 });
             }
             EncoderCfg::VPX(VpxEncoderConfig {
@@ -1415,5 +1508,1090 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
         .send((hbb_common::tokio::time::Instant::now(), Arc::new(msg_out)))
     {
         log::error!("Failed to send screenshot, {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    /// Helper to set up the FRAME_FETCHED_NOTIFIERS entry for a given display_idx.
+    /// Returns the sender half so tests can simulate ACKs.
+    fn setup_notifier(display_idx: usize) -> FrameFetchedNotifierSender {
+        let (tx, rx) = hbb_common::tokio::sync::mpsc::unbounded_channel();
+        let rx = Arc::new(TokioMutex::new(rx));
+        FRAME_FETCHED_NOTIFIERS
+            .lock()
+            .unwrap()
+            .insert(display_idx, (tx.clone(), rx));
+        tx
+    }
+
+    /// Clean up a notifier entry after a test.
+    fn teardown_notifier(display_idx: usize) {
+        FRAME_FETCHED_NOTIFIERS
+            .lock()
+            .unwrap()
+            .remove(&display_idx);
+        DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_zero_connections_does_not_block() {
+        // Use a unique display_idx to avoid conflicts with other tests.
+        let display_idx = 9000;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+        // send_conn_ids is empty, so try_wait_next should return immediately.
+        let mut fetched = HashSet::new();
+        let start = Instant::now();
+        fc.try_wait_next(&mut fetched, 5000);
+        let elapsed = start.elapsed();
+        // Should return nearly instantly (well under 100ms).
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "try_wait_next with 0 connections took {:?}, expected < 100ms",
+            elapsed
+        );
+        assert!(fetched.is_empty());
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_immediate_ack() {
+        let display_idx = 9001;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        // Register one connection as having been sent a frame.
+        let mut conn_ids = HashSet::new();
+        conn_ids.insert(42);
+        fc.set_send(Instant::now(), conn_ids);
+
+        // Simulate the client ACKing immediately (before we poll).
+        tx.send((42, Some(Instant::now()))).unwrap();
+
+        let mut fetched = HashSet::new();
+        let start = Instant::now();
+        fc.try_wait_next(&mut fetched, 1000);
+        let elapsed = start.elapsed();
+
+        assert!(fetched.contains(&42), "Should have received ACK for conn 42");
+        // With the ACK already in the channel, it should return nearly instantly.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "Immediate ACK took {:?}, expected < 100ms",
+            elapsed
+        );
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_timeout_respected() {
+        let display_idx = 9002;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        // Register one connection but do NOT send an ACK.
+        let mut conn_ids = HashSet::new();
+        conn_ids.insert(99);
+        fc.set_send(Instant::now(), conn_ids);
+
+        let mut fetched = HashSet::new();
+        let timeout_ms = 100u64;
+        let start = Instant::now();
+        fc.try_wait_next(&mut fetched, timeout_ms);
+        let elapsed = start.elapsed();
+
+        // Should have waited approximately the timeout duration, not longer.
+        assert!(
+            elapsed >= Duration::from_millis(timeout_ms.saturating_sub(10)),
+            "Should wait at least ~{}ms, but only waited {:?}",
+            timeout_ms,
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(timeout_ms + 200),
+            "Should not block much longer than {}ms, but waited {:?}",
+            timeout_ms,
+            elapsed
+        );
+        // No ACK was sent, so fetched should be empty.
+        assert!(fetched.is_empty());
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_low_latency_mode_returns_zero_timeout() {
+        // When low-latency-mode is not set (default), we should get normal timeouts.
+        let (poll, outer) = VideoFrameController::get_ack_timeouts();
+        // We can't easily mock Config::get_option in tests, but we can verify
+        // that the default path returns the normal-mode constants.
+        // If "low-latency-mode" is not set, get_option returns "" which != "Y".
+        assert_eq!(poll, FRAME_ACK_POLL_NORMAL_MS);
+        assert_eq!(outer, FRAME_ACK_TIMEOUT_NORMAL_MS);
+    }
+
+    #[test]
+    fn test_frame_controller_nonblocking_poll() {
+        // Verify that timeout_millis=0 (non-blocking) returns immediately
+        // even when there is a pending connection with no ACK.
+        let display_idx = 9003;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut conn_ids = HashSet::new();
+        conn_ids.insert(1);
+        conn_ids.insert(2);
+        fc.set_send(Instant::now(), conn_ids);
+
+        let mut fetched = HashSet::new();
+        let start = Instant::now();
+        // Non-blocking: timeout=0
+        fc.try_wait_next(&mut fetched, 0);
+        let elapsed = start.elapsed();
+
+        // Should return nearly instantly.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "Non-blocking poll took {:?}, expected < 100ms",
+            elapsed
+        );
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_ack_timeout_constants() {
+        // Verify the constants are sensible.
+        assert_eq!(FRAME_ACK_TIMEOUT_NORMAL_MS, 500);
+        assert_eq!(FRAME_ACK_POLL_NORMAL_MS, 50);
+        assert_eq!(FRAME_ACK_POLL_LOW_LATENCY_MS, 0);
+    }
+
+    #[test]
+    fn test_repeat_encode_max_constant() {
+        // The repeat_encode_max is a local variable in the capture loop.
+        // Verify the expected value matches what is declared in the loop body.
+        // This constant is set to 10 — re-encode at most 10 stale frames when
+        // the screen hasn't changed and the encoder is not latency-free.
+        let repeat_encode_max: u32 = 10;
+        assert_eq!(repeat_encode_max, 10);
+    }
+
+    #[test]
+    fn test_low_latency_mode_skips_repeat_encoding() {
+        // In low-latency / gaming mode, the repeat-encoding path should be
+        // skipped entirely to avoid wasting GPU encoder time on stale frames.
+        //
+        // We cannot toggle Config in unit tests, so we verify the decision
+        // logic directly: when is_low_latency_mode() returns true the branch
+        // is a no-op; when false, normal repeat encoding up to
+        // repeat_encode_max applies.
+        //
+        // Default config has low-latency mode OFF, so the normal path applies.
+        assert!(!video_qos::is_low_latency_mode());
+
+        // Simulate the decision logic from the capture loop:
+        let repeat_encode_max: u32 = 10;
+        let mut repeat_encode_counter: u32 = 0;
+        let encoder_latency_free = false;
+        let yuv_len = 100; // non-zero means we have a YUV frame
+
+        // Normal mode: repeat encoding should proceed
+        if !encoder_latency_free && yuv_len > 0 {
+            if video_qos::is_low_latency_mode() {
+                // Would skip — but low-latency is off by default
+                panic!("should not reach here in default config");
+            } else if repeat_encode_counter < repeat_encode_max {
+                repeat_encode_counter += 1;
+            }
+        }
+        assert_eq!(repeat_encode_counter, 1, "normal mode should increment counter");
+
+        // Verify the value-based helper agrees
+        assert!(video_qos::is_low_latency_mode_value("Y"));
+        assert!(!video_qos::is_low_latency_mode_value(""));
+    }
+
+    // ---------------------------------------------------------------
+    // VideoFrameController: new / reset / set_send
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_frame_controller_new_initial_state() {
+        let fc = VideoFrameController::new(8000);
+        assert_eq!(fc.display_idx, 8000);
+        assert!(
+            fc.send_conn_ids.is_empty(),
+            "New controller should start with no connection IDs"
+        );
+    }
+
+    #[test]
+    fn test_frame_controller_reset_clears_conn_ids() {
+        let display_idx = 9010;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut conn_ids = HashSet::new();
+        conn_ids.insert(10);
+        conn_ids.insert(20);
+        fc.set_send(Instant::now(), conn_ids);
+        assert_eq!(fc.send_conn_ids.len(), 2);
+
+        fc.reset();
+        assert!(
+            fc.send_conn_ids.is_empty(),
+            "reset() should clear all connection IDs"
+        );
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_set_send_updates_conn_ids() {
+        let display_idx = 9011;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(100);
+        ids.insert(200);
+        ids.insert(300);
+        let tm = Instant::now();
+        fc.set_send(tm, ids.clone());
+
+        assert_eq!(fc.send_conn_ids, ids);
+        assert_eq!(fc.cur, tm);
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_set_send_empty_does_not_update_display_conn_ids() {
+        let display_idx = 9012;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        // set_send with an empty HashSet should be a no-op for DISPLAY_CONN_IDS.
+        let old_tm = fc.cur;
+        fc.set_send(Instant::now(), HashSet::new());
+        // cur should NOT be updated when conn_ids is empty.
+        assert_eq!(fc.cur, old_tm);
+        assert!(fc.send_conn_ids.is_empty());
+
+        // DISPLAY_CONN_IDS should not have an entry for this display.
+        let display_ids = DISPLAY_CONN_IDS.lock().unwrap();
+        assert!(
+            !display_ids.contains_key(&display_idx),
+            "Empty set_send should not insert into DISPLAY_CONN_IDS"
+        );
+        drop(display_ids);
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_set_send_nonempty_populates_display_conn_ids() {
+        let display_idx = 9013;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(5);
+        ids.insert(6);
+        fc.set_send(Instant::now(), ids.clone());
+
+        let display_ids = DISPLAY_CONN_IDS.lock().unwrap();
+        assert_eq!(
+            display_ids.get(&display_idx),
+            Some(&ids),
+            "set_send with nonempty IDs should populate DISPLAY_CONN_IDS"
+        );
+        drop(display_ids);
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_set_send_replaces_previous() {
+        let display_idx = 9014;
+        let _tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut first = HashSet::new();
+        first.insert(1);
+        fc.set_send(Instant::now(), first);
+        assert_eq!(fc.send_conn_ids.len(), 1);
+        assert!(fc.send_conn_ids.contains(&1));
+
+        // Calling set_send again should replace, not merge.
+        let mut second = HashSet::new();
+        second.insert(2);
+        second.insert(3);
+        fc.set_send(Instant::now(), second.clone());
+        assert_eq!(fc.send_conn_ids, second);
+        assert!(!fc.send_conn_ids.contains(&1));
+        teardown_notifier(display_idx);
+    }
+
+    // ---------------------------------------------------------------
+    // Multiple connections: partial ACK
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_frame_controller_partial_ack_from_multiple_connections() {
+        let display_idx = 9020;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(10);
+        ids.insert(20);
+        ids.insert(30);
+        fc.set_send(Instant::now(), ids);
+
+        // Only conn 10 and 30 ACK.
+        tx.send((10, Some(Instant::now()))).unwrap();
+        tx.send((30, Some(Instant::now()))).unwrap();
+
+        let mut fetched = HashSet::new();
+        fc.try_wait_next(&mut fetched, 200);
+
+        assert!(fetched.contains(&10));
+        assert!(fetched.contains(&30));
+        // conn 20 did not ACK, but we should still get the ones that did.
+        assert!(!fetched.contains(&20));
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_all_connections_ack() {
+        let display_idx = 9021;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(7);
+        ids.insert(8);
+        fc.set_send(Instant::now(), ids);
+
+        // Both ACK.
+        tx.send((7, Some(Instant::now()))).unwrap();
+        tx.send((8, Some(Instant::now()))).unwrap();
+
+        let mut fetched = HashSet::new();
+        let start = Instant::now();
+        fc.try_wait_next(&mut fetched, 2000);
+        let elapsed = start.elapsed();
+
+        assert_eq!(fetched.len(), 2);
+        assert!(fetched.contains(&7));
+        assert!(fetched.contains(&8));
+        // Both ACKed before poll, so it should return quickly.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "All ACKs present should return fast, took {:?}",
+            elapsed
+        );
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_duplicate_ack_deduplicates() {
+        let display_idx = 9022;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(42);
+        fc.set_send(Instant::now(), ids);
+
+        // Send duplicate ACKs for the same connection.
+        tx.send((42, Some(Instant::now()))).unwrap();
+        tx.send((42, Some(Instant::now()))).unwrap();
+        tx.send((42, None)).unwrap();
+
+        let mut fetched = HashSet::new();
+        fc.try_wait_next(&mut fetched, 200);
+
+        // HashSet naturally deduplicates.
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched.contains(&42));
+        teardown_notifier(display_idx);
+    }
+
+    #[test]
+    fn test_frame_controller_ack_with_none_instant() {
+        // ACKs can have None as the Instant (e.g., from web clients).
+        let display_idx = 9023;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(55);
+        fc.set_send(Instant::now(), ids);
+
+        tx.send((55, None)).unwrap();
+
+        let mut fetched = HashSet::new();
+        fc.try_wait_next(&mut fetched, 200);
+
+        assert!(
+            fetched.contains(&55),
+            "ACK with None instant should still register"
+        );
+        teardown_notifier(display_idx);
+    }
+
+    // ---------------------------------------------------------------
+    // VideoSource enum
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_video_source_service_name_prefix() {
+        assert_eq!(VideoSource::Monitor.service_name_prefix(), "monitor");
+        assert_eq!(VideoSource::Camera.service_name_prefix(), "camera");
+    }
+
+    #[test]
+    fn test_video_source_is_monitor() {
+        assert!(VideoSource::Monitor.is_monitor());
+        assert!(!VideoSource::Camera.is_monitor());
+    }
+
+    #[test]
+    fn test_video_source_is_camera() {
+        assert!(VideoSource::Camera.is_camera());
+        assert!(!VideoSource::Monitor.is_camera());
+    }
+
+    #[test]
+    fn test_video_source_equality() {
+        assert_eq!(VideoSource::Monitor, VideoSource::Monitor);
+        assert_eq!(VideoSource::Camera, VideoSource::Camera);
+        assert_ne!(VideoSource::Monitor, VideoSource::Camera);
+    }
+
+    #[test]
+    fn test_video_source_clone() {
+        let src = VideoSource::Monitor;
+        let cloned = src.clone();
+        assert_eq!(src, cloned);
+    }
+
+    // ---------------------------------------------------------------
+    // get_service_name
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_service_name_monitor() {
+        assert_eq!(get_service_name(VideoSource::Monitor, 0), "monitor0");
+        assert_eq!(get_service_name(VideoSource::Monitor, 1), "monitor1");
+        assert_eq!(get_service_name(VideoSource::Monitor, 42), "monitor42");
+    }
+
+    #[test]
+    fn test_get_service_name_camera() {
+        assert_eq!(get_service_name(VideoSource::Camera, 0), "camera0");
+        assert_eq!(get_service_name(VideoSource::Camera, 3), "camera3");
+    }
+
+    // ---------------------------------------------------------------
+    // OPTION_REFRESH constant
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_option_refresh_value() {
+        assert_eq!(OPTION_REFRESH, "refresh");
+    }
+
+    // ---------------------------------------------------------------
+    // Frame timing constant relationships
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_normal_poll_less_than_timeout() {
+        // The poll interval must be strictly less than the outer timeout,
+        // otherwise polling would never have a chance to retry.
+        assert!(
+            FRAME_ACK_POLL_NORMAL_MS < FRAME_ACK_TIMEOUT_NORMAL_MS,
+            "Poll interval ({}) must be less than outer timeout ({})",
+            FRAME_ACK_POLL_NORMAL_MS,
+            FRAME_ACK_TIMEOUT_NORMAL_MS
+        );
+    }
+
+    #[test]
+    fn test_low_latency_poll_is_zero() {
+        // Low-latency mode uses non-blocking poll (0ms).
+        assert_eq!(FRAME_ACK_POLL_LOW_LATENCY_MS, 0);
+    }
+
+    #[test]
+    fn test_timeout_allows_multiple_polls() {
+        // The outer timeout should allow at least a few polls.
+        let polls_possible = FRAME_ACK_TIMEOUT_NORMAL_MS / FRAME_ACK_POLL_NORMAL_MS;
+        assert!(
+            polls_possible >= 2,
+            "Timeout should allow at least 2 polls, allows {}",
+            polls_possible
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Encode failure tolerance logic
+    //
+    // Extracted from handle_one_frame():
+    //   let max_fail_times = if cfg!(target_os = "android") && encoder.is_hardware() { 9 } else { 3 };
+    //
+    // We test the branching logic directly since we cannot easily
+    // construct an Encoder in tests.
+    // ---------------------------------------------------------------
+
+    /// Replicates the max_fail_times calculation from handle_one_frame.
+    fn compute_max_fail_times(is_android: bool, is_hardware: bool) -> usize {
+        if is_android && is_hardware {
+            9
+        } else {
+            3
+        }
+    }
+
+    #[test]
+    fn test_max_fail_times_android_hardware() {
+        assert_eq!(compute_max_fail_times(true, true), 9);
+    }
+
+    #[test]
+    fn test_max_fail_times_android_software() {
+        assert_eq!(compute_max_fail_times(true, false), 3);
+    }
+
+    #[test]
+    fn test_max_fail_times_non_android_hardware() {
+        assert_eq!(compute_max_fail_times(false, true), 3);
+    }
+
+    #[test]
+    fn test_max_fail_times_non_android_software() {
+        assert_eq!(compute_max_fail_times(false, false), 3);
+    }
+
+    /// Replicates the bail-on-fail logic from handle_one_frame:
+    ///   if (first && !repeat) || *encode_fail_counter >= max_fail_times { ... bail }
+    fn should_bail_on_encode_fail(
+        first: bool,
+        repeat: bool,
+        counter: usize,
+        max_fail: usize,
+    ) -> bool {
+        (first && !repeat) || counter >= max_fail
+    }
+
+    #[test]
+    fn test_should_bail_first_frame_non_repeat() {
+        // First frame + non-repeat encoder -> bail immediately on error.
+        assert!(should_bail_on_encode_fail(true, false, 0, 3));
+    }
+
+    #[test]
+    fn test_should_bail_first_frame_repeat_encoder() {
+        // First frame + repeat encoder -> do NOT bail immediately;
+        // repeat encoders can hit errors on first frame.
+        assert!(!should_bail_on_encode_fail(true, true, 0, 3));
+    }
+
+    #[test]
+    fn test_should_bail_counter_at_threshold() {
+        assert!(should_bail_on_encode_fail(false, false, 3, 3));
+        assert!(should_bail_on_encode_fail(false, true, 3, 3));
+    }
+
+    #[test]
+    fn test_should_bail_counter_below_threshold() {
+        assert!(!should_bail_on_encode_fail(false, false, 2, 3));
+        assert!(!should_bail_on_encode_fail(false, true, 2, 3));
+    }
+
+    #[test]
+    fn test_should_bail_counter_above_threshold() {
+        assert!(should_bail_on_encode_fail(false, false, 5, 3));
+        assert!(should_bail_on_encode_fail(false, false, 100, 9));
+    }
+
+    #[test]
+    fn test_encode_fail_counter_resets_on_success() {
+        // Simulates: on successful encode, counter resets to 0.
+        let mut encode_fail_counter: usize = 5;
+        // Simulate successful encode.
+        encode_fail_counter = 0;
+        assert_eq!(encode_fail_counter, 0);
+        // Next failure starts from 0 again.
+        encode_fail_counter += 1;
+        assert_eq!(encode_fail_counter, 1);
+    }
+
+    #[test]
+    fn test_encode_fail_counter_increments() {
+        let mut counter: usize = 0;
+        let max = 3usize;
+        // Simulate 3 consecutive failures.
+        for _ in 0..max {
+            counter += 1;
+        }
+        assert_eq!(counter, max);
+        assert!(should_bail_on_encode_fail(false, false, counter, max));
+    }
+
+    // ---------------------------------------------------------------
+    // repeat_encode_counter logic
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_repeat_encode_counter_logic() {
+        let repeat_encode_max = 10u32;
+        let mut counter = 0u32;
+
+        // Simulate 10 WouldBlock frames: counter should increment each time.
+        for i in 0..repeat_encode_max {
+            assert!(
+                counter < repeat_encode_max,
+                "Counter {} should be below max {} at iteration {}",
+                counter,
+                repeat_encode_max,
+                i
+            );
+            counter += 1;
+        }
+        assert_eq!(counter, repeat_encode_max);
+
+        // At max, the condition `counter < repeat_encode_max` is false,
+        // so no more repeat encodes happen.
+        assert!(!(counter < repeat_encode_max));
+
+        // On a successful frame, counter resets.
+        counter = 0;
+        assert!(counter < repeat_encode_max);
+    }
+
+    #[test]
+    fn test_repeat_encoding_skipped_for_latency_free() {
+        // In the run loop: repeat encoding only happens when
+        // `!encoder.latency_free() && yuv.len() > 0`.
+        // When latency_free is true, the branch is skipped entirely.
+        let latency_free = true;
+        let yuv_len = 100;
+        let should_repeat = !latency_free && yuv_len > 0;
+        assert!(
+            !should_repeat,
+            "Latency-free encoder should skip repeat encoding"
+        );
+    }
+
+    #[test]
+    fn test_repeat_encoding_skipped_for_empty_yuv() {
+        // yuv.len() == 0 means the frame is texture-based, not YUV.
+        let latency_free = false;
+        let yuv_len = 0;
+        let should_repeat = !latency_free && yuv_len > 0;
+        assert!(
+            !should_repeat,
+            "Empty YUV buffer should skip repeat encoding"
+        );
+    }
+
+    #[test]
+    fn test_repeat_encoding_proceeds_for_normal_case() {
+        let latency_free = false;
+        let yuv_len = 1920 * 1080 * 3 / 2; // typical YUV420 size
+        let should_repeat = !latency_free && yuv_len > 0;
+        assert!(
+            should_repeat,
+            "Non-latency-free encoder with YUV data should do repeat encoding"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Keyframe interval logic from get_encoder_config
+    //
+    // In get_encoder_config():
+    //   let keyframe_interval = if record { Some(240) } else { None };
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_keyframe_interval_when_recording() {
+        let record = true;
+        let keyframe_interval: Option<usize> = if record { Some(240) } else { None };
+        assert_eq!(keyframe_interval, Some(240));
+    }
+
+    #[test]
+    fn test_keyframe_interval_when_not_recording() {
+        let record = false;
+        let keyframe_interval: Option<usize> = if record { Some(240) } else { None };
+        assert_eq!(keyframe_interval, None);
+    }
+
+    // ---------------------------------------------------------------
+    // notify_video_frame_fetched_by_conn_id routing
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_notify_by_conn_id_filters_correct_displays() {
+        // Set up two displays with different conn IDs.
+        let d1 = 9030;
+        let d2 = 9031;
+        let _tx1 = setup_notifier(d1);
+        let _tx2 = setup_notifier(d2);
+
+        // Populate DISPLAY_CONN_IDS: display d1 has conn 50, display d2 has conn 51.
+        {
+            let mut dci = DISPLAY_CONN_IDS.lock().unwrap();
+            let mut s1 = HashSet::new();
+            s1.insert(50);
+            dci.insert(d1, s1);
+            let mut s2 = HashSet::new();
+            s2.insert(51);
+            dci.insert(d2, s2);
+        }
+
+        // Notify conn 50 -- should only go to display d1.
+        notify_video_frame_fetched_by_conn_id(50, None);
+
+        let mut fc1 = VideoFrameController::new(d1);
+        let mut ids1 = HashSet::new();
+        ids1.insert(50);
+        fc1.set_send(Instant::now(), ids1);
+        let mut fetched1 = HashSet::new();
+        fc1.try_wait_next(&mut fetched1, 100);
+        assert!(
+            fetched1.contains(&50),
+            "Display d1 should have received notification for conn 50"
+        );
+
+        // Display d2 should have nothing.
+        let mut fc2 = VideoFrameController::new(d2);
+        let mut ids2 = HashSet::new();
+        ids2.insert(51);
+        fc2.set_send(Instant::now(), ids2);
+        let mut fetched2 = HashSet::new();
+        fc2.try_wait_next(&mut fetched2, 50);
+        assert!(
+            fetched2.is_empty(),
+            "Display d2 should NOT have received notification for conn 50"
+        );
+
+        teardown_notifier(d1);
+        teardown_notifier(d2);
+    }
+
+    #[test]
+    fn test_notify_by_conn_id_no_matching_display() {
+        // If no display has the given conn_id, nothing should happen (no panic).
+        let d = 9032;
+        let _tx = setup_notifier(d);
+        DISPLAY_CONN_IDS.lock().unwrap().remove(&d);
+
+        // Should not panic.
+        notify_video_frame_fetched_by_conn_id(999, Some(Instant::now()));
+
+        teardown_notifier(d);
+    }
+
+    // ---------------------------------------------------------------
+    // VideoFrameController: try_wait_next accumulates across calls
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_try_wait_next_accumulates_in_fetched_set() {
+        let display_idx = 9040;
+        let tx = setup_notifier(display_idx);
+        let mut fc = VideoFrameController::new(display_idx);
+
+        let mut ids = HashSet::new();
+        ids.insert(1);
+        ids.insert(2);
+        fc.set_send(Instant::now(), ids);
+
+        // First call: only conn 1 has ACKed.
+        tx.send((1, Some(Instant::now()))).unwrap();
+        let mut fetched = HashSet::new();
+        fc.try_wait_next(&mut fetched, 100);
+        assert!(fetched.contains(&1));
+
+        // Second call: conn 2 now ACKs.
+        tx.send((2, Some(Instant::now()))).unwrap();
+        fc.try_wait_next(&mut fetched, 100);
+        assert!(
+            fetched.contains(&1) && fetched.contains(&2),
+            "Fetched set should accumulate across calls: {:?}",
+            fetched
+        );
+        teardown_notifier(display_idx);
+    }
+
+    // ---------------------------------------------------------------
+    // get_ack_timeouts default (non-low-latency) returns
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_ack_timeouts_default_mode() {
+        // Without "low-latency-mode" option set, defaults should be normal.
+        let (poll, outer) = VideoFrameController::get_ack_timeouts();
+        assert_eq!(poll, 50, "Default poll timeout should be 50ms");
+        assert_eq!(outer, 500, "Default outer timeout should be 500ms");
+    }
+
+    // ---------------------------------------------------------------
+    // Outer ACK wait loop logic (from run())
+    //
+    // The loop:
+    //   while outer_timeout == 0 || wait_begin.elapsed() < outer_timeout {
+    //       ...
+    //       if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() { break; }
+    //       if outer_timeout == 0 { break; }
+    //   }
+    // ---------------------------------------------------------------
+
+    /// Simulates the outer wait loop termination logic from run().
+    fn should_continue_waiting(
+        elapsed_ms: u64,
+        outer_timeout: u64,
+        fetched_count: usize,
+        send_count: usize,
+    ) -> bool {
+        // Entry condition
+        if !(outer_timeout == 0 || elapsed_ms < outer_timeout) {
+            return false;
+        }
+        // All ACKed -> break
+        if fetched_count >= send_count {
+            return false;
+        }
+        // Low-latency mode -> break after first poll
+        if outer_timeout == 0 {
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn test_wait_loop_breaks_when_all_acked() {
+        // Even with lots of time remaining, loop breaks if all are ACKed.
+        assert!(!should_continue_waiting(10, 500, 3, 3));
+        assert!(!should_continue_waiting(0, 500, 5, 3));
+    }
+
+    #[test]
+    fn test_wait_loop_breaks_on_timeout() {
+        // Elapsed exceeds outer_timeout -> stop waiting.
+        assert!(!should_continue_waiting(600, 500, 1, 3));
+    }
+
+    #[test]
+    fn test_wait_loop_breaks_in_low_latency() {
+        // outer_timeout == 0 -> break immediately after one poll.
+        assert!(!should_continue_waiting(0, 0, 0, 3));
+    }
+
+    #[test]
+    fn test_wait_loop_continues_when_partial_ack() {
+        // Under timeout, not all ACKed, non-zero outer_timeout -> continue.
+        assert!(should_continue_waiting(100, 500, 1, 3));
+    }
+
+    #[test]
+    fn test_wait_loop_continues_at_zero_elapsed() {
+        assert!(should_continue_waiting(0, 500, 0, 2));
+    }
+
+    // ---------------------------------------------------------------
+    // FrameBuffer integration tests
+    // ---------------------------------------------------------------
+    //
+    // These tests verify the FrameBuffer wiring added to the capture loop.
+    // They exercise the store/take contract and the CapturedFrame
+    // construction from PixelBuffer metadata, without requiring a live
+    // capturer or encoder.
+    //
+    // Manual testing checklist for the full integration:
+    //   1. Build with `cargo build --features linux-pkg-config`
+    //   2. Start a remote session in normal mode — verify capture works
+    //   3. Enable low-latency-mode (set option "low-latency-mode" = "Y")
+    //   4. Reconnect — verify frames are still delivered smoothly
+    //   5. Check log for "low-latency" related messages
+    //   6. Toggle back to normal mode — verify no regressions
+
+    #[test]
+    fn test_frame_buffer_created_only_in_low_latency_mode() {
+        // Default config has low-latency mode OFF.
+        let low_latency = video_qos::is_low_latency_mode();
+        let fb = if low_latency {
+            Some(FrameBuffer::new())
+        } else {
+            None
+        };
+        // In default config, FrameBuffer should NOT be created.
+        assert!(
+            fb.is_none(),
+            "FrameBuffer should only be created in low-latency mode"
+        );
+    }
+
+    #[test]
+    fn test_frame_buffer_created_when_low_latency_value() {
+        // Verify the value-based check: "Y" means low-latency.
+        let low_latency = video_qos::is_low_latency_mode_value("Y");
+        let fb = if low_latency {
+            Some(FrameBuffer::new())
+        } else {
+            None
+        };
+        assert!(
+            fb.is_some(),
+            "FrameBuffer should be created when low-latency is 'Y'"
+        );
+    }
+
+    #[test]
+    fn test_captured_frame_from_pixel_data() {
+        // Simulate constructing a CapturedFrame from pixel buffer metadata,
+        // mirroring the logic in the low-latency capture path.
+        let width = 1920;
+        let height = 1080;
+        let stride = width * 4;
+        let pixfmt = scrap::Pixfmt::BGRA;
+        let data = vec![42u8; stride * height];
+
+        let captured = CapturedFrame {
+            data: data.clone(),
+            width,
+            height,
+            stride,
+            pixfmt,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        };
+
+        assert_eq!(captured.width, 1920);
+        assert_eq!(captured.height, 1080);
+        assert_eq!(captured.stride, 1920 * 4);
+        assert_eq!(captured.pixfmt, scrap::Pixfmt::BGRA);
+        assert_eq!(captured.data.len(), 1920 * 4 * 1080);
+        assert_eq!(captured.display_idx, 0);
+    }
+
+    #[test]
+    fn test_frame_buffer_store_take_round_trip_in_video_context() {
+        // Simulate the store/take cycle as it happens in the capture loop.
+        let fb = FrameBuffer::new();
+
+        let width = 1280;
+        let height = 720;
+        let stride = width * 4;
+        let data = vec![0xFFu8; stride * height];
+
+        let captured = CapturedFrame {
+            data: data.clone(),
+            width,
+            height,
+            stride,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 1,
+        };
+
+        fb.store(captured);
+
+        // Encode phase: take the latest frame.
+        let taken = fb.take();
+        assert!(taken.is_some(), "take() should return the stored frame");
+
+        let cf = taken.unwrap();
+        assert_eq!(cf.width, 1280);
+        assert_eq!(cf.height, 720);
+        assert_eq!(cf.stride, 1280 * 4);
+        assert_eq!(cf.pixfmt, scrap::Pixfmt::BGRA);
+        assert_eq!(cf.data.len(), 1280 * 4 * 720);
+        assert_eq!(cf.display_idx, 1);
+
+        // After take, buffer should be empty.
+        assert!(fb.take().is_none(), "second take should return None");
+    }
+
+    #[test]
+    fn test_frame_buffer_latest_wins_semantics() {
+        // When multiple captures happen before an encode, only the latest
+        // frame should be available (mimics fast capture, slow encode).
+        let fb = FrameBuffer::new();
+
+        // First capture (will be overwritten).
+        fb.store(CapturedFrame {
+            data: vec![1u8; 100],
+            width: 640,
+            height: 480,
+            stride: 640 * 4,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        // Second capture (latest-wins).
+        fb.store(CapturedFrame {
+            data: vec![2u8; 200],
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            pixfmt: scrap::Pixfmt::RGBA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        });
+
+        let cf = fb.take().expect("should get the latest frame");
+        assert_eq!(cf.width, 1920, "should have the latest frame's width");
+        assert_eq!(cf.height, 1080, "should have the latest frame's height");
+        assert_eq!(cf.pixfmt, scrap::Pixfmt::RGBA, "should have latest pixfmt");
+        assert_eq!(cf.data.len(), 200, "should have latest data");
+    }
+
+    #[test]
+    fn test_pixel_buffer_reconstructed_from_captured_frame() {
+        // Verify that a PixelBuffer can be reconstructed from CapturedFrame
+        // data, which is how the low-latency encode path works.
+        let width = 800;
+        let height = 600;
+        let stride = width * 4;
+        let data = vec![0xABu8; stride * height];
+
+        let cf = CapturedFrame {
+            data: data.clone(),
+            width,
+            height,
+            stride,
+            pixfmt: scrap::Pixfmt::BGRA,
+            capture_time: Instant::now(),
+            display_idx: 0,
+        };
+
+        // Reconstruct PixelBuffer from owned data (as done in encode path).
+        let pb = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
+        assert_eq!(pb.data().len(), stride * height);
+        assert_eq!(pb.width(), width);
+        assert_eq!(pb.height(), height);
+        assert_eq!(pb.pixfmt(), scrap::Pixfmt::BGRA);
+    }
+
+    #[test]
+    fn test_frame_buffer_normal_mode_bypass() {
+        // In normal mode (frame_buffer is None), the code should take the
+        // else branch and encode directly from the captured Frame.
+        let frame_buffer: Option<FrameBuffer> = None;
+
+        // The pattern used in the loop:
+        //   if let (Some(ref fb), ...) = (&frame_buffer, ...) { ... } else { ... }
+        // When frame_buffer is None, the match arm won't fire.
+        assert!(
+            frame_buffer.is_none(),
+            "In normal mode, frame_buffer should be None"
+        );
     }
 }

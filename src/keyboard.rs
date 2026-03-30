@@ -1399,3 +1399,1203 @@ pub mod input_source {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::message_proto::*;
+    use rdev::{Event, EventType, Key, UnicodeInfo};
+    use std::sync::Mutex as StdMutex;
+    use std::time::SystemTime;
+
+    // -----------------------------------------------------------------------
+    // Global lock: tests that read/write MODIFIERS_STATE or TO_RELEASE must
+    // hold this lock to avoid races (cargo test runs in parallel by default).
+    // -----------------------------------------------------------------------
+
+    lazy_static::lazy_static! {
+        static ref TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: construct a minimal rdev::Event for testing
+    // -----------------------------------------------------------------------
+
+    fn make_event(event_type: EventType) -> Event {
+        Event {
+            time: SystemTime::now(),
+            unicode: None,
+            event_type,
+            platform_code: 0,
+            position_code: 0,
+            usb_hid: 0,
+        }
+    }
+
+    fn make_key_press(key: Key) -> Event {
+        make_event(EventType::KeyPress(key))
+    }
+
+    fn make_key_release(key: Key) -> Event {
+        make_event(EventType::KeyRelease(key))
+    }
+
+    fn make_key_press_with_position(key: Key, position_code: u32) -> Event {
+        let mut e = make_key_press(key);
+        e.position_code = position_code;
+        e
+    }
+
+    fn make_key_release_with_position(key: Key, position_code: u32) -> Event {
+        let mut e = make_key_release(key);
+        e.position_code = position_code;
+        e
+    }
+
+    fn make_event_with_unicode(event_type: EventType, name: Option<String>) -> Event {
+        let mut e = make_event(event_type);
+        e.unicode = Some(UnicodeInfo {
+            name,
+            unicode: vec![],
+            is_dead: false,
+        });
+        e
+    }
+
+    /// Reset MODIFIERS_STATE to all-false between tests that touch it.
+    fn reset_modifiers_state() {
+        let mut m = MODIFIERS_STATE.lock().unwrap();
+        for v in m.values_mut() {
+            *v = false;
+        }
+    }
+
+    /// Reset TO_RELEASE between tests that touch it.
+    fn reset_to_release() {
+        TO_RELEASE.lock().unwrap().clear();
+    }
+
+    // ===================================================================
+    // 1. get_keyboard_mode_enum  — string to protobuf enum
+    // ===================================================================
+
+    #[test]
+    fn test_get_keyboard_mode_enum_map() {
+        assert_eq!(get_keyboard_mode_enum("map"), KeyboardMode::Map);
+    }
+
+    #[test]
+    fn test_get_keyboard_mode_enum_translate() {
+        assert_eq!(get_keyboard_mode_enum("translate"), KeyboardMode::Translate);
+    }
+
+    #[test]
+    fn test_get_keyboard_mode_enum_legacy() {
+        assert_eq!(get_keyboard_mode_enum("legacy"), KeyboardMode::Legacy);
+    }
+
+    #[test]
+    fn test_get_keyboard_mode_enum_unknown_defaults_to_map() {
+        assert_eq!(get_keyboard_mode_enum("auto"), KeyboardMode::Map);
+        assert_eq!(get_keyboard_mode_enum(""), KeyboardMode::Map);
+        assert_eq!(get_keyboard_mode_enum("bogus"), KeyboardMode::Map);
+    }
+
+    // ===================================================================
+    // 2. is_modifier  — rdev::Key classification
+    // ===================================================================
+
+    #[test]
+    fn test_is_modifier_true_for_all_modifiers() {
+        let modifiers = [
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::ControlLeft,
+            Key::ControlRight,
+            Key::MetaLeft,
+            Key::MetaRight,
+            Key::Alt,
+            Key::AltGr,
+        ];
+        for key in &modifiers {
+            assert!(is_modifier(key), "{:?} should be a modifier", key);
+        }
+    }
+
+    #[test]
+    fn test_is_modifier_false_for_non_modifiers() {
+        let non_modifiers = [
+            Key::KeyA,
+            Key::Num1,
+            Key::Space,
+            Key::Return,
+            Key::Escape,
+            Key::F1,
+            Key::CapsLock,
+            Key::NumLock,
+            Key::Tab,
+            Key::Kp0,
+        ];
+        for key in &non_modifiers {
+            assert!(!is_modifier(key), "{:?} should NOT be a modifier", key);
+        }
+    }
+
+    // ===================================================================
+    // 3. is_numpad_rdev_key  — numpad key classification
+    // ===================================================================
+
+    #[test]
+    fn test_is_numpad_rdev_key_true() {
+        let numpad_keys = [
+            Key::Kp0,
+            Key::Kp1,
+            Key::Kp2,
+            Key::Kp3,
+            Key::Kp4,
+            Key::Kp5,
+            Key::Kp6,
+            Key::Kp7,
+            Key::Kp8,
+            Key::Kp9,
+            Key::KpMinus,
+            Key::KpMultiply,
+            Key::KpDivide,
+            Key::KpPlus,
+            Key::KpDecimal,
+        ];
+        for key in &numpad_keys {
+            assert!(
+                is_numpad_rdev_key(key),
+                "{:?} should be a numpad key",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_numpad_rdev_key_false() {
+        let non_numpad = [
+            Key::Num0,
+            Key::Num1,
+            Key::KeyA,
+            Key::Return,
+            Key::KpReturn,
+            Key::Space,
+        ];
+        for key in &non_numpad {
+            assert!(
+                !is_numpad_rdev_key(key),
+                "{:?} should NOT be a numpad key",
+                key
+            );
+        }
+    }
+
+    // ===================================================================
+    // 4. is_letter_rdev_key  — A-Z classification
+    // ===================================================================
+
+    #[test]
+    fn test_is_letter_rdev_key_all_letters() {
+        let letters = [
+            Key::KeyA, Key::KeyB, Key::KeyC, Key::KeyD, Key::KeyE, Key::KeyF,
+            Key::KeyG, Key::KeyH, Key::KeyI, Key::KeyJ, Key::KeyK, Key::KeyL,
+            Key::KeyM, Key::KeyN, Key::KeyO, Key::KeyP, Key::KeyQ, Key::KeyR,
+            Key::KeyS, Key::KeyT, Key::KeyU, Key::KeyV, Key::KeyW, Key::KeyX,
+            Key::KeyY, Key::KeyZ,
+        ];
+        assert_eq!(letters.len(), 26);
+        for key in &letters {
+            assert!(is_letter_rdev_key(key), "{:?} should be a letter key", key);
+        }
+    }
+
+    #[test]
+    fn test_is_letter_rdev_key_false_for_digits_and_symbols() {
+        assert!(!is_letter_rdev_key(&Key::Num0));
+        assert!(!is_letter_rdev_key(&Key::Space));
+        assert!(!is_letter_rdev_key(&Key::Comma));
+        assert!(!is_letter_rdev_key(&Key::SemiColon));
+    }
+
+    // ===================================================================
+    // 5. is_letter_rdev_key_ex  — extra "letter-like" keys (issue #8599)
+    // ===================================================================
+
+    #[test]
+    fn test_is_letter_rdev_key_ex_true() {
+        let extra = [
+            Key::LeftBracket,
+            Key::RightBracket,
+            Key::SemiColon,
+            Key::Quote,
+            Key::Comma,
+            Key::Dot,
+        ];
+        for key in &extra {
+            assert!(
+                is_letter_rdev_key_ex(key),
+                "{:?} should be letter_ex",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_letter_rdev_key_ex_false_for_letters() {
+        assert!(!is_letter_rdev_key_ex(&Key::KeyA));
+        assert!(!is_letter_rdev_key_ex(&Key::KeyZ));
+        assert!(!is_letter_rdev_key_ex(&Key::Num0));
+    }
+
+    // ===================================================================
+    // 6. is_numpad_key / is_letter_key_4_lock_modes  — Event wrappers
+    // ===================================================================
+
+    #[test]
+    fn test_is_numpad_key_event() {
+        assert!(is_numpad_key(&make_key_press(Key::Kp5)));
+        assert!(is_numpad_key(&make_key_release(Key::KpDecimal)));
+        assert!(!is_numpad_key(&make_key_press(Key::Num5)));
+        // Mouse events are not numpad keys
+        assert!(!is_numpad_key(&make_event(EventType::MouseMove {
+            x: 0.0,
+            y: 0.0
+        })));
+    }
+
+    #[test]
+    fn test_is_letter_key_4_lock_modes_event() {
+        // Real letter
+        assert!(is_letter_key_4_lock_modes(&make_key_press(Key::KeyA)));
+        // Extended letter (issue #8599)
+        assert!(is_letter_key_4_lock_modes(&make_key_press(
+            Key::SemiColon
+        )));
+        // Not a letter
+        assert!(!is_letter_key_4_lock_modes(&make_key_press(Key::Kp0)));
+        assert!(!is_letter_key_4_lock_modes(&make_key_press(Key::F1)));
+    }
+
+    // ===================================================================
+    // 7. parse_add_lock_modes_modifiers  — bitfield to modifiers list
+    // ===================================================================
+
+    #[test]
+    fn test_parse_add_lock_modes_caps_lock_on_letter() {
+        let mut ke = KeyEvent::new();
+        // CAPS_LOCK = bit 1 => bitmask (1 << 1) = 2
+        let lock_modes = 1 << 1; // caps lock on
+        parse_add_lock_modes_modifiers(&mut ke, lock_modes, false, true);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(
+            ke.modifiers[0].enum_value(),
+            Ok(ControlKey::CapsLock)
+        );
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_num_lock_on_numpad() {
+        let mut ke = KeyEvent::new();
+        // NUM_LOCK = bit 2 => bitmask (1 << 2) = 4
+        let lock_modes = 1 << 2; // num lock on
+        parse_add_lock_modes_modifiers(&mut ke, lock_modes, true, false);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(
+            ke.modifiers[0].enum_value(),
+            Ok(ControlKey::NumLock)
+        );
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_both_on_but_only_matching_key_type() {
+        // Both caps and num lock on, but the key is only a letter (not numpad)
+        let mut ke = KeyEvent::new();
+        let lock_modes = (1 << 1) | (1 << 2);
+        parse_add_lock_modes_modifiers(&mut ke, lock_modes, false, true);
+        // Only CapsLock should be added because is_numpad_key=false
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(
+            ke.modifiers[0].enum_value(),
+            Ok(ControlKey::CapsLock)
+        );
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_both_on_numpad_key() {
+        // Both caps and num lock on, key is numpad (not letter)
+        let mut ke = KeyEvent::new();
+        let lock_modes = (1 << 1) | (1 << 2);
+        parse_add_lock_modes_modifiers(&mut ke, lock_modes, true, false);
+        // Only NumLock should be added because is_letter_key=false
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(
+            ke.modifiers[0].enum_value(),
+            Ok(ControlKey::NumLock)
+        );
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_no_locks() {
+        let mut ke = KeyEvent::new();
+        parse_add_lock_modes_modifiers(&mut ke, 0, true, true);
+        assert!(ke.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_irrelevant_bits_ignored() {
+        // Set bits other than caps/num lock — should add nothing
+        let mut ke = KeyEvent::new();
+        // bit 0 and bit 3 are not CAPS_LOCK or NUM_LOCK
+        parse_add_lock_modes_modifiers(&mut ke, 0b1001, true, true);
+        assert!(ke.modifiers.is_empty());
+    }
+
+    // ===================================================================
+    // 8. client::event_lock_screen  — pure KeyEvent constructor
+    // ===================================================================
+
+    #[test]
+    fn test_event_lock_screen() {
+        let ke = client::event_lock_screen();
+        assert_eq!(
+            ke.union,
+            Some(key_event::Union::ControlKey(ControlKey::LockScreen.into()))
+        );
+        assert!(ke.down);
+        assert_eq!(ke.mode.enum_value(), Ok(KeyboardMode::Legacy));
+    }
+
+    // ===================================================================
+    // 9. client::legacy_modifiers  — modifier flag injection
+    // ===================================================================
+
+    #[test]
+    fn test_legacy_modifiers_adds_alt() {
+        let mut ke = KeyEvent::new();
+        ke.set_chr('a' as u32);
+        client::legacy_modifiers(&mut ke, true, false, false, false);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(ke.modifiers[0].enum_value(), Ok(ControlKey::Alt));
+    }
+
+    #[test]
+    fn test_legacy_modifiers_adds_shift() {
+        let mut ke = KeyEvent::new();
+        ke.set_chr('a' as u32);
+        client::legacy_modifiers(&mut ke, false, false, true, false);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(ke.modifiers[0].enum_value(), Ok(ControlKey::Shift));
+    }
+
+    #[test]
+    fn test_legacy_modifiers_adds_ctrl() {
+        let mut ke = KeyEvent::new();
+        ke.set_chr('a' as u32);
+        client::legacy_modifiers(&mut ke, false, true, false, false);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(ke.modifiers[0].enum_value(), Ok(ControlKey::Control));
+    }
+
+    #[test]
+    fn test_legacy_modifiers_adds_meta() {
+        let mut ke = KeyEvent::new();
+        ke.set_chr('a' as u32);
+        client::legacy_modifiers(&mut ke, false, false, false, true);
+        assert_eq!(ke.modifiers.len(), 1);
+        assert_eq!(ke.modifiers[0].enum_value(), Ok(ControlKey::Meta));
+    }
+
+    #[test]
+    fn test_legacy_modifiers_adds_all_four() {
+        let mut ke = KeyEvent::new();
+        ke.set_chr('x' as u32);
+        client::legacy_modifiers(&mut ke, true, true, true, true);
+        assert_eq!(ke.modifiers.len(), 4);
+    }
+
+    #[test]
+    fn test_legacy_modifiers_skips_if_key_is_alt() {
+        // If the key event IS the Alt key, don't double-add Alt modifier
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::Alt);
+        client::legacy_modifiers(&mut ke, true, false, false, false);
+        assert!(ke.modifiers.is_empty(), "should not add Alt when key is Alt");
+    }
+
+    #[test]
+    fn test_legacy_modifiers_skips_if_key_is_ralt() {
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::RAlt);
+        client::legacy_modifiers(&mut ke, true, false, false, false);
+        assert!(
+            ke.modifiers.is_empty(),
+            "should not add Alt when key is RAlt"
+        );
+    }
+
+    #[test]
+    fn test_legacy_modifiers_skips_if_key_is_shift() {
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::Shift);
+        client::legacy_modifiers(&mut ke, false, false, true, false);
+        assert!(ke.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_modifiers_skips_if_key_is_control() {
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::Control);
+        client::legacy_modifiers(&mut ke, false, true, false, false);
+        assert!(ke.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_modifiers_skips_if_key_is_meta() {
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::Meta);
+        client::legacy_modifiers(&mut ke, false, false, false, true);
+        assert!(ke.modifiers.is_empty());
+    }
+
+    // ===================================================================
+    // 10. is_long_press  — detects held modifier keys
+    // ===================================================================
+
+    #[test]
+    fn test_is_long_press_false_for_first_press() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        let event = make_key_press(Key::ShiftLeft);
+        assert!(!is_long_press(&event));
+    }
+
+    #[test]
+    fn test_is_long_press_true_when_modifier_already_down() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        // Simulate ShiftLeft already being held
+        {
+            let mut m = MODIFIERS_STATE.lock().unwrap();
+            m.insert(Key::ShiftLeft, true);
+        }
+        let event = make_key_press(Key::ShiftLeft);
+        assert!(is_long_press(&event));
+
+        // Clean up
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_is_long_press_false_for_release() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        {
+            let mut m = MODIFIERS_STATE.lock().unwrap();
+            m.insert(Key::ControlLeft, true);
+        }
+        // Release events should never be "long press"
+        let event = make_key_release(Key::ControlLeft);
+        assert!(!is_long_press(&event));
+
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_is_long_press_false_for_non_modifier_keys() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        // Regular keys are not tracked in MODIFIERS_STATE
+        let event = make_key_press(Key::KeyA);
+        assert!(!is_long_press(&event));
+    }
+
+    // ===================================================================
+    // 11. update_modifiers_state  — tracks press/release of modifiers
+    // ===================================================================
+
+    #[test]
+    fn test_update_modifiers_state_press_sets_true() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        let event = make_key_press(Key::Alt);
+        update_modifiers_state(&event);
+
+        let m = MODIFIERS_STATE.lock().unwrap();
+        assert_eq!(*m.get(&Key::Alt).unwrap(), true);
+
+        drop(m);
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_update_modifiers_state_release_sets_false() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        // First press
+        update_modifiers_state(&make_key_press(Key::MetaLeft));
+        {
+            let m = MODIFIERS_STATE.lock().unwrap();
+            assert_eq!(*m.get(&Key::MetaLeft).unwrap(), true);
+        }
+        // Then release
+        update_modifiers_state(&make_key_release(Key::MetaLeft));
+        {
+            let m = MODIFIERS_STATE.lock().unwrap();
+            assert_eq!(*m.get(&Key::MetaLeft).unwrap(), false);
+        }
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_update_modifiers_state_ignores_non_modifiers() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        let event = make_key_press(Key::KeyA);
+        update_modifiers_state(&event);
+        // KeyA should not appear in the map (and the map should be unchanged)
+        let m = MODIFIERS_STATE.lock().unwrap();
+        assert!(m.get(&Key::KeyA).is_none());
+        drop(m);
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_update_modifiers_state_ignores_mouse_events() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        let event = make_event(EventType::MouseMove { x: 10.0, y: 20.0 });
+        update_modifiers_state(&event);
+        // Nothing should change
+        let m = MODIFIERS_STATE.lock().unwrap();
+        for &v in m.values() {
+            assert!(!v);
+        }
+        drop(m);
+        reset_modifiers_state();
+    }
+
+    // ===================================================================
+    // 12. keycode_to_rdev_key  — platform keycode to rdev::Key
+    // ===================================================================
+
+    #[test]
+    fn test_keycode_to_rdev_key_known_linux_codes() {
+        // On Linux, keycode_to_rdev_key delegates to rdev::linux_key_from_code.
+        // rdev uses XKB keycodes (not raw evdev).
+        assert_eq!(keycode_to_rdev_key(38), Key::KeyA);
+        assert_eq!(keycode_to_rdev_key(56), Key::KeyB);
+        assert_eq!(keycode_to_rdev_key(9), Key::Escape);
+        assert_eq!(keycode_to_rdev_key(36), Key::Return);
+        assert_eq!(keycode_to_rdev_key(65), Key::Space);
+        assert_eq!(keycode_to_rdev_key(50), Key::ShiftLeft);
+        assert_eq!(keycode_to_rdev_key(37), Key::ControlLeft);
+        assert_eq!(keycode_to_rdev_key(64), Key::Alt);
+    }
+
+    #[test]
+    fn test_keycode_to_rdev_key_function_keys() {
+        // XKB keycodes: F1=67, F12=96
+        assert_eq!(keycode_to_rdev_key(67), Key::F1);
+        assert_eq!(keycode_to_rdev_key(96), Key::F12);
+    }
+
+    #[test]
+    fn test_keycode_to_rdev_key_numpad() {
+        // XKB keycodes: Kp0=90, Kp1=87, Kp7=79
+        assert_eq!(keycode_to_rdev_key(90), Key::Kp0);
+        assert_eq!(keycode_to_rdev_key(87), Key::Kp1);
+        assert_eq!(keycode_to_rdev_key(79), Key::Kp7);
+    }
+
+    // ===================================================================
+    // 13. is_modifier_code  — KeyEvent chr field → modifier check
+    // ===================================================================
+
+    #[test]
+    fn test_is_modifier_code_true_for_modifier_linux_codes() {
+        // XKB keycodes: ControlLeft=37, ShiftLeft=50, Alt=64
+        let mut ke = KeyEvent::new();
+        ke.set_chr(37u32);
+        assert!(is_modifier_code(&ke));
+
+        ke.set_chr(50u32);
+        assert!(is_modifier_code(&ke));
+
+        ke.set_chr(64u32);
+        assert!(is_modifier_code(&ke));
+    }
+
+    #[test]
+    fn test_is_modifier_code_false_for_regular_keys() {
+        // XKB keycodes: KeyA=38, Space=65
+        let mut ke = KeyEvent::new();
+        ke.set_chr(38u32);
+        assert!(!is_modifier_code(&ke));
+
+        ke.set_chr(65u32);
+        assert!(!is_modifier_code(&ke));
+    }
+
+    #[test]
+    fn test_is_modifier_code_false_for_control_key_union() {
+        // When the union is ControlKey (not Chr), should return false
+        let mut ke = KeyEvent::new();
+        ke.set_control_key(ControlKey::Alt);
+        assert!(!is_modifier_code(&ke));
+    }
+
+    // ===================================================================
+    // 14. map_keyboard_mode (Linux)  — key event to protobuf via position_code
+    // ===================================================================
+
+    #[test]
+    fn test_map_keyboard_mode_linux_to_linux_press() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // Linux→Linux: position_code passes through directly
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = map_keyboard_mode("linux", &event, ke);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].down);
+        // On Linux→Linux, keycode = position_code = 30
+        match results[0].union {
+            Some(key_event::Union::Chr(code)) => assert_eq!(code, 38),
+            _ => panic!("expected Chr union, got {:?}", results[0].union),
+        }
+    }
+
+    #[test]
+    fn test_map_keyboard_mode_linux_to_linux_release() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        let event = make_key_release_with_position(Key::KeyA, 38);
+        let results = map_keyboard_mode("linux", &event, ke);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].down);
+    }
+
+    #[test]
+    fn test_map_keyboard_mode_returns_empty_for_mouse_events() {
+        let ke = KeyEvent::new();
+        let event = make_event(EventType::MouseMove { x: 0.0, y: 0.0 });
+        let results = map_keyboard_mode("linux", &event, ke);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_map_keyboard_mode_linux_to_windows() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // XKB 38 = KeyA -> should convert to Windows scancode (0x1E = 30)
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = map_keyboard_mode("windows", &event, ke);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].down);
+    }
+
+    #[test]
+    fn test_map_keyboard_mode_linux_to_macos() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // XKB 38 = KeyA -> should convert to macOS kVK_ANSI_A = 0
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = map_keyboard_mode("macos", &event, ke);
+        assert_eq!(results.len(), 1);
+        match results[0].union {
+            Some(key_event::Union::Chr(code)) => assert_eq!(code, 0),
+            _ => panic!("expected Chr union for macOS KeyA"),
+        }
+    }
+
+    // ===================================================================
+    // 15. event_to_key_events  — integration-level: mode dispatch + lock modes
+    // ===================================================================
+
+    #[test]
+    fn test_event_to_key_events_map_mode_basic() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results =
+            event_to_key_events("linux".to_string(), &event, KeyboardMode::Map, None);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].down);
+        assert_eq!(results[0].mode.enum_value(), Ok(KeyboardMode::Map));
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_map_mode_with_lock_modes_numpad() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // NumLock on (bit 2), pressing Kp5 (evdev=76)
+        let lock_modes = 1 << 2;
+        let event = make_key_press_with_position(Key::Kp5, 84);
+        let results = event_to_key_events(
+            "linux".to_string(),
+            &event,
+            KeyboardMode::Map,
+            Some(lock_modes),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .modifiers
+                .iter()
+                .any(|m| m.enum_value() == Ok(ControlKey::NumLock)),
+            "NumLock modifier should be present for numpad key when NumLock is on"
+        );
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_map_mode_with_caps_lock_letter() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // CapsLock on (bit 1), pressing KeyA (evdev=30)
+        let lock_modes = 1 << 1;
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = event_to_key_events(
+            "linux".to_string(),
+            &event,
+            KeyboardMode::Map,
+            Some(lock_modes),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .modifiers
+                .iter()
+                .any(|m| m.enum_value() == Ok(ControlKey::CapsLock)),
+            "CapsLock modifier should be present for letter key when CapsLock is on"
+        );
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_no_lock_mode_for_non_matching_key() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // CapsLock on, but pressing a numpad key — should NOT add CapsLock
+        let lock_modes = 1 << 1;
+        let event = make_key_press_with_position(Key::Kp5, 84);
+        let results = event_to_key_events(
+            "linux".to_string(),
+            &event,
+            KeyboardMode::Map,
+            Some(lock_modes),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0]
+                .modifiers
+                .iter()
+                .any(|m| m.enum_value() == Ok(ControlKey::CapsLock)),
+            "CapsLock should NOT be added for a numpad key"
+        );
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_peer_string_whitespace_stripped() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // Whitespace in peer string should be stripped
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = event_to_key_events(
+            " li nux ".to_string(),
+            &event,
+            KeyboardMode::Map,
+            None,
+        );
+        // Should still work as "linux" after whitespace removal
+        assert_eq!(results.len(), 1);
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_tracks_to_release() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let _ = event_to_key_events("linux".to_string(), &event, KeyboardMode::Map, None);
+        // Key should be tracked in TO_RELEASE
+        {
+            let tr = TO_RELEASE.lock().unwrap();
+            assert!(tr.contains_key(&Key::KeyA));
+        }
+        // Release it
+        let event = make_key_release_with_position(Key::KeyA, 38);
+        let _ = event_to_key_events("linux".to_string(), &event, KeyboardMode::Map, None);
+        {
+            let tr = TO_RELEASE.lock().unwrap();
+            assert!(!tr.contains_key(&Key::KeyA));
+        }
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_release_event() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let event = make_key_release_with_position(Key::KeyA, 38);
+        let results =
+            event_to_key_events("linux".to_string(), &event, KeyboardMode::Map, None);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].down);
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    // ===================================================================
+    // 16. translate_keyboard_mode  — falls back to map for numpad/non-unicode
+    // ===================================================================
+
+    #[test]
+    fn test_translate_mode_numpad_falls_back_to_map() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        let event = make_key_press_with_position(Key::Kp5, 84);
+        let results = translate_keyboard_mode("linux", &event, ke);
+        // Numpad keys use map mode in translate, so should get a result
+        assert_eq!(results.len(), 1);
+        assert!(results[0].down);
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_translate_mode_dead_key_returns_empty() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        let mut event = make_key_press(Key::KeyA);
+        event.unicode = Some(UnicodeInfo {
+            name: Some("a".to_string()),
+            unicode: vec![],
+            is_dead: true,
+        });
+        let results = translate_keyboard_mode("linux", &event, ke);
+        assert!(results.is_empty(), "dead keys should be ignored");
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_translate_mode_with_unicode_sends_seq() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        let event = make_event_with_unicode(
+            EventType::KeyPress(Key::KeyA),
+            Some("a".to_string()),
+        );
+        let results = translate_keyboard_mode("linux", &event, ke);
+        // Should contain a seq event for the unicode character
+        let has_seq = results.iter().any(|e| e.has_seq());
+        assert!(has_seq, "translate mode should produce seq event for unicode input");
+        // The seq event should have down=true
+        let seq_event = results.iter().find(|e| e.has_seq()).unwrap();
+        assert!(seq_event.down);
+        assert_eq!(seq_event.seq(), "a");
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_translate_mode_without_unicode_falls_back_to_map() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // No unicode info, non-numpad key — should fallback to map mode
+        let event = make_key_press_with_position(Key::Escape, 9);
+        let results = translate_keyboard_mode("linux", &event, ke);
+        assert_eq!(results.len(), 1);
+        // Should have chr set (from map mode fallback)
+        assert!(results[0].has_chr());
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    // ===================================================================
+    // 17. is_press helper (Linux only)
+    // ===================================================================
+
+    #[test]
+    fn test_is_press_true_for_keypress() {
+        let event = make_key_press(Key::KeyA);
+        assert!(is_press(&event));
+    }
+
+    #[test]
+    fn test_is_press_false_for_key_release() {
+        let event = make_key_release(Key::KeyA);
+        assert!(!is_press(&event));
+    }
+
+    #[test]
+    fn test_is_press_false_for_mouse_event() {
+        let event = make_event(EventType::MouseMove { x: 0.0, y: 0.0 });
+        assert!(!is_press(&event));
+    }
+
+    // ===================================================================
+    // 18. is_altgr (Linux-specific)
+    // ===================================================================
+
+    #[test]
+    fn test_is_altgr_linux_true_for_0xfe03() {
+        let mut event = make_key_press(Key::AltGr);
+        event.platform_code = 0xFE03;
+        assert!(is_altgr(&event));
+    }
+
+    #[test]
+    fn test_is_altgr_linux_false_for_other_codes() {
+        let mut event = make_key_press(Key::Alt);
+        event.platform_code = 0xFFE9; // regular Alt keysym
+        assert!(!is_altgr(&event));
+    }
+
+    // ===================================================================
+    // 19. client::get_modifiers_state  — combines global + local flags
+    // ===================================================================
+
+    #[test]
+    fn test_get_modifiers_state_passthrough_when_global_false() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        // When global state is all false, function returns local flags
+        let (alt, ctrl, shift, cmd) = client::get_modifiers_state(true, true, true, true);
+        assert!(alt);
+        assert!(ctrl);
+        assert!(shift);
+        assert!(cmd);
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_get_modifiers_state_global_overrides() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        {
+            let mut m = MODIFIERS_STATE.lock().unwrap();
+            m.insert(Key::ControlLeft, true);
+        }
+        // Even though local ctrl=false, global ControlLeft=true makes it true
+        let (alt, ctrl, shift, cmd) =
+            client::get_modifiers_state(false, false, false, false);
+        assert!(!alt);
+        assert!(ctrl);
+        assert!(!shift);
+        assert!(!cmd);
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_get_modifiers_state_right_variants() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        {
+            let mut m = MODIFIERS_STATE.lock().unwrap();
+            m.insert(Key::ShiftRight, true);
+            m.insert(Key::ControlRight, true);
+            m.insert(Key::MetaRight, true);
+            m.insert(Key::AltGr, true);
+        }
+        let (alt, ctrl, shift, cmd) =
+            client::get_modifiers_state(false, false, false, false);
+        assert!(alt, "AltGr should count as alt");
+        assert!(ctrl, "ControlRight should count as ctrl");
+        assert!(shift, "ShiftRight should count as shift");
+        assert!(cmd, "MetaRight should count as command");
+        reset_modifiers_state();
+    }
+
+    // ===================================================================
+    // 20. Edge cases and regression-like tests
+    // ===================================================================
+
+    #[test]
+    fn test_map_mode_empty_for_unknown_conversion() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // Use position_code 0 which may not map to anything on some platforms
+        // For Linux→macOS or Linux→Windows, 0 might not convert
+        let event = make_key_press_with_position(Key::Unknown(0), 0);
+        let results = map_keyboard_mode("macos", &event, ke);
+        // 0 may or may not convert — we just check it doesn't panic
+        // The result is either empty (conversion failed) or has 1 event
+        assert!(results.len() <= 1);
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_event_to_key_events_mouse_event_returns_empty() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let event = make_event(EventType::MouseMove { x: 5.0, y: 10.0 });
+        let results =
+            event_to_key_events("linux".to_string(), &event, KeyboardMode::Map, None);
+        assert!(results.is_empty());
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_translate_mode_lock_modes_added_for_numpad_keys() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // In translate mode, lock modes ARE added for numpad keys
+        let lock_modes = 1 << 2; // NumLock
+        let event = make_key_press_with_position(Key::Kp5, 84);
+        let results = event_to_key_events(
+            "linux".to_string(),
+            &event,
+            KeyboardMode::Translate,
+            Some(lock_modes),
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .modifiers
+                .iter()
+                .any(|m| m.enum_value() == Ok(ControlKey::NumLock)),
+            "Translate mode should add NumLock for numpad keys"
+        );
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_translate_mode_lock_modes_not_added_for_letter_keys() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        // In translate mode, lock modes should NOT be added for non-numpad keys
+        // because `keyboard_mode != KeyboardMode::Translate || is_numpad_key` gates it
+        let lock_modes = 1 << 1; // CapsLock
+        let event = make_event_with_unicode(
+            EventType::KeyPress(Key::KeyA),
+            Some("a".to_string()),
+        );
+        let results = event_to_key_events(
+            "linux".to_string(),
+            &event,
+            KeyboardMode::Translate,
+            Some(lock_modes),
+        );
+        // For translate mode with non-numpad key, lock modes should not be applied
+        for r in &results {
+            assert!(
+                !r.modifiers
+                    .iter()
+                    .any(|m| m.enum_value() == Ok(ControlKey::CapsLock)),
+                "Translate mode should NOT add CapsLock for letter keys"
+            );
+        }
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_map_mode_linux_to_android() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+        let ke = KeyEvent::new();
+        // Evdev 30 = KeyA → should convert to Android key code
+        let event = make_key_press_with_position(Key::KeyA, 38);
+        let results = map_keyboard_mode("android", &event, ke);
+        // Should produce a result if the conversion exists
+        assert_eq!(results.len(), 1);
+        assert!(results[0].down);
+        reset_modifiers_state();
+        reset_to_release();
+    }
+
+    #[test]
+    fn test_multiple_modifier_tracking_lifecycle() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_modifiers_state();
+        reset_to_release();
+
+        // Press Ctrl, then Shift
+        update_modifiers_state(&make_key_press(Key::ControlLeft));
+        update_modifiers_state(&make_key_press(Key::ShiftLeft));
+        {
+            let m = MODIFIERS_STATE.lock().unwrap();
+            assert!(*m.get(&Key::ControlLeft).unwrap());
+            assert!(*m.get(&Key::ShiftLeft).unwrap());
+        }
+
+        // Release Ctrl but Shift still held
+        update_modifiers_state(&make_key_release(Key::ControlLeft));
+        {
+            let m = MODIFIERS_STATE.lock().unwrap();
+            assert!(!m.get(&Key::ControlLeft).unwrap());
+            assert!(*m.get(&Key::ShiftLeft).unwrap());
+        }
+
+        // Release Shift
+        update_modifiers_state(&make_key_release(Key::ShiftLeft));
+        {
+            let m = MODIFIERS_STATE.lock().unwrap();
+            assert!(!m.get(&Key::ShiftLeft).unwrap());
+        }
+
+        reset_modifiers_state();
+    }
+
+    #[test]
+    fn test_parse_add_lock_modes_caps_and_num_both_active_for_both_key_types() {
+        // If a key is somehow both numpad and letter (hypothetical), both modifiers added
+        let mut ke = KeyEvent::new();
+        let lock_modes = (1 << 1) | (1 << 2);
+        parse_add_lock_modes_modifiers(&mut ke, lock_modes, true, true);
+        assert_eq!(ke.modifiers.len(), 2);
+        let has_caps = ke
+            .modifiers
+            .iter()
+            .any(|m| m.enum_value() == Ok(ControlKey::CapsLock));
+        let has_num = ke
+            .modifiers
+            .iter()
+            .any(|m| m.enum_value() == Ok(ControlKey::NumLock));
+        assert!(has_caps);
+        assert!(has_num);
+    }
+}

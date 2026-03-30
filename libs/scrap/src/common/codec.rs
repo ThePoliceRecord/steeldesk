@@ -627,6 +627,23 @@ impl Decoder {
         self.valid
     }
 
+    // Dispatch incoming video frames to the appropriate decoder.
+    //
+    // For H.264/H.265 frames, two hardware paths exist (selected at decoder
+    // creation time based on feature flags and GPU capabilities):
+    //
+    //   VRAM path (feature = "vram"):
+    //     GPU texture → GPU encode → network → GPU decode → GPU texture → render
+    //     Output: ImageTexture (GPU pointer, no CPU copy)
+    //
+    //   HwRam path (feature = "hwcodec"):
+    //     GPU texture → CPU copy → GPU encode → network → GPU decode → CPU copy → render
+    //     Output: ImageRgb (CPU buffer, requires GPU→CPU readback + color conversion)
+    //
+    // VRAM decoders are checked first; if present, the frame is decoded
+    // entirely on the GPU and `_pixelbuffer` is set to false so the renderer
+    // knows to use the texture directly.
+    //
     // rgb [in/out] fmt and stride must be set in ImageRgb
     pub fn handle_video_frame(
         &mut self,
@@ -762,6 +779,18 @@ impl Decoder {
         }
     }
 
+    // HwRam decode data flow (CPU round-trip):
+    //   network → encoded H.264/H.265 bitstream
+    //     → HwRamDecoder::decode() (GPU decode via ffmpeg hw accel)
+    //     → DecodeFrame { data: [&[u8]], pixfmt: NV12/I420 } (CPU buffer)
+    //     → HwRamDecoderImage::to_fmt() (CPU color convert NV12/I420 → ARGB via libyuv)
+    //     → ImageRgb (CPU ARGB buffer)
+    //     → render
+    //
+    // This path crosses the GPU-CPU boundary twice: once when the decoder
+    // outputs decoded frames to CPU memory, and again implicitly when the
+    // renderer uploads the ARGB buffer to a display surface.
+    //
     // rgb [in/out] fmt and stride must be set in ImageRgb
     #[cfg(feature = "hwcodec")]
     fn handle_hwram_video_frame(
@@ -782,6 +811,19 @@ impl Decoder {
         return Ok(ret);
     }
 
+    // VRAM decode data flow (zero-copy GPU path):
+    //   network → encoded H.264/H.265 bitstream
+    //     → VRamDecoder::decode() (GPU decode, output stays in GPU memory)
+    //     → DecodeFrame { texture: *mut c_void, width, height } (GPU texture ptr)
+    //     → ImageTexture { texture, w, h } (GPU texture handle passed to renderer)
+    //     → render directly from GPU texture (no CPU copy)
+    //
+    // This path keeps decoded frame data entirely on the GPU. The renderer
+    // (e.g., D3D11 on Windows) can consume the texture pointer directly
+    // without any GPU→CPU→GPU round-trip. This is the fastest decode path.
+    //
+    // Currently Windows-only (D3D11 textures). Future: VAAPI surfaces on
+    // Linux, IOSurface/Metal textures on macOS.
     #[cfg(feature = "vram")]
     fn handle_vram_video_frame(
         decoder: &mut VRamDecoder,

@@ -5,7 +5,7 @@ use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERV
 use crate::{
     client::{
         self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
-        QualityStatus, MILLI1, SEC30,
+        QualityStatus, CURSOR_PREDICTOR, MILLI1, SEC30,
     },
     common::get_default_sound_input,
     ui_session_interface::{InvokeUiSession, Session},
@@ -1347,6 +1347,11 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         self.handler.handle_peer_info(pi);
+                        // Initialize cursor prediction — enable when
+                        // low-latency mode is active.
+                        let low_latency =
+                            hbb_common::config::Config::get_option("low-latency-mode") == "Y";
+                        client::init_cursor_predictor(low_latency);
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
@@ -1421,6 +1426,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.set_cursor_id(id.to_string());
                 }
                 Some(message::Union::CursorPosition(cp)) => {
+                    if let Some(predictor) = CURSOR_PREDICTOR.read().unwrap().as_ref() {
+                        predictor.on_server_cursor(cp.x, cp.y);
+                    }
                     self.handler.set_cursor_position(cp);
                 }
                 Some(message::Union::Clipboard(cb)) => {
@@ -2315,7 +2323,7 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     fn new_video_thread(&mut self, display: usize) {
-        let video_queue = Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE)));
+        let video_queue = Arc::new(RwLock::new(ArrayQueue::new(client::video_queue_size())));
         let (video_sender, video_receiver) = std::sync::mpsc::channel::<MediaData>();
         let decode_fps = Arc::new(RwLock::new(None));
         let frame_count = Arc::new(RwLock::new(0));

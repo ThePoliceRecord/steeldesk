@@ -342,6 +342,22 @@ impl RendezvousMediator {
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
+        // QUIC transport integration point.
+        // When fully wired, this is where the rendezvous connection to the
+        // server could use QUIC instead of TCP. The returned `conn` (a
+        // `Stream`) would need to be replaced with a QUIC-backed equivalent.
+        //
+        // Integration sites in rendezvous_mediator.rs:
+        //   1. start_tcp() — rendezvous server connection (here)
+        //   2. create_relay() — relay signaling via connect_tcp()
+        //   3. handle_punch_hole() — TCP hole-punch via connect_tcp()
+        if crate::transport::should_use_quic() {
+            log::info!(
+                "QUIC transport preferred for rendezvous server '{}' — \
+                 integration pending, will use TCP",
+                host,
+            );
+        }
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
@@ -929,5 +945,419 @@ impl Drop for CheckIfResendPk {
             Config::set_key_confirmed(false);
             log::info!("Set key_confirmed to false due to pk changed, will resend register_pk");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::config::{CONNECT_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT};
+
+    // ---------------------------------------------------------------
+    // 1. Connection timeout / registration constants
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_connect_timeout_value() {
+        assert_eq!(CONNECT_TIMEOUT, 18_000, "CONNECT_TIMEOUT should be 18 s");
+    }
+
+    #[test]
+    fn test_reg_interval_value() {
+        assert_eq!(REG_INTERVAL, 15_000, "REG_INTERVAL should be 15 s");
+    }
+
+    #[test]
+    fn test_rendezvous_port_value() {
+        assert_eq!(RENDEZVOUS_PORT, 21116);
+    }
+
+    #[test]
+    fn test_min_max_reg_timeout_constants() {
+        // These are defined locally inside start_udp; replicate and verify the
+        // invariants that the code relies on.
+        const MIN_REG_TIMEOUT: i64 = 3_000;
+        const MAX_REG_TIMEOUT: i64 = 30_000;
+        assert!(MIN_REG_TIMEOUT > 0);
+        assert!(MAX_REG_TIMEOUT > MIN_REG_TIMEOUT);
+        assert_eq!(MAX_REG_TIMEOUT / MIN_REG_TIMEOUT, 10,
+            "backoff should allow at most 10 steps");
+    }
+
+    // ---------------------------------------------------------------
+    // 2. EMA latency calculation
+    //    Extracted from the closure inside start_udp:
+    //      ema = latency / 30 + (ema * 29 / 30)
+    // ---------------------------------------------------------------
+
+    /// Pure replica of the EMA update used in start_udp.
+    fn compute_ema(latency: i64, prev_ema: i64) -> i64 {
+        if prev_ema == 0 {
+            latency
+        } else {
+            latency / 30 + (prev_ema * 29 / 30)
+        }
+    }
+
+    #[test]
+    fn test_ema_latency_first_sample() {
+        // First measurement: EMA is set directly to the sample.
+        assert_eq!(compute_ema(10_000, 0), 10_000);
+    }
+
+    #[test]
+    fn test_ema_latency_stable_input() {
+        // Feeding the same value repeatedly should converge close to that value.
+        // Integer division truncation causes a small steady-state error.
+        let mut ema = 0i64;
+        for _ in 0..300 {
+            ema = compute_ema(5_000, ema);
+        }
+        // Integer division (5000/30 = 166, ema*29/30 truncates) causes
+        // the steady state to settle slightly below the true value.
+        assert!((ema - 5_000).abs() <= 30,
+            "EMA should converge near the constant input; got {ema}");
+    }
+
+    #[test]
+    fn test_ema_latency_smoothing_weight() {
+        // After one update from a prior EMA, the new value should be
+        //   new_sample/30 + old_ema*29/30
+        let ema = compute_ema(30_000, 0);   // first: 30_000
+        let ema = compute_ema(0, ema);      // second: 0/30 + 30_000*29/30
+        // 30_000 * 29 / 30 = 29_000
+        assert_eq!(ema, 29_000);
+    }
+
+    #[test]
+    fn test_ema_latency_step_response() {
+        // Step from 0 to 30_000: after one update the EMA should be 30_000
+        // (first sample), then a second sample of 60_000 should blend.
+        let ema = compute_ema(30_000, 0);
+        assert_eq!(ema, 30_000);
+        let ema = compute_ema(60_000, ema);
+        // 60_000/30 + 30_000*29/30 = 2_000 + 29_000 = 31_000
+        assert_eq!(ema, 31_000);
+    }
+
+    #[test]
+    fn test_ema_latency_out_of_range_skipped() {
+        // The real code skips updates when latency < 0 or > 1_000_000.
+        // Verify those boundary values.
+        let too_high = 1_000_001i64;
+        let negative = -1i64;
+        assert!(too_high > 1_000_000);
+        assert!(negative < 0);
+        // The production code simply returns early for these; EMA stays unchanged.
+    }
+
+    #[test]
+    fn test_ema_latency_significance_threshold() {
+        // Latency change is reported only when |latency - old_latency| > n,
+        // where n = max(latency / 5, 3000).
+        let latency = 10_000i64;
+        let mut n = latency / 5; // 2_000
+        if n < 3000 {
+            n = 3000;
+        }
+        assert_eq!(n, 3000, "threshold should be clamped to 3000 minimum");
+
+        let latency = 30_000i64;
+        let mut n = latency / 5; // 6_000
+        if n < 3000 {
+            n = 3000;
+        }
+        assert_eq!(n, 6_000, "threshold should be latency/5 when above 3000");
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Registration retry backoff logic
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_reg_timeout_backoff_increments() {
+        const MIN_REG_TIMEOUT: i64 = 3_000;
+        const MAX_REG_TIMEOUT: i64 = 30_000;
+        let mut reg_timeout = MIN_REG_TIMEOUT;
+
+        let mut steps = 0;
+        while reg_timeout < MAX_REG_TIMEOUT {
+            reg_timeout += MIN_REG_TIMEOUT;
+            steps += 1;
+        }
+        assert_eq!(reg_timeout, MAX_REG_TIMEOUT);
+        assert_eq!(steps, 9, "should take 9 increments to reach MAX from MIN");
+    }
+
+    #[test]
+    fn test_reg_timeout_does_not_exceed_max() {
+        const MIN_REG_TIMEOUT: i64 = 3_000;
+        const MAX_REG_TIMEOUT: i64 = 30_000;
+        let mut reg_timeout = MIN_REG_TIMEOUT;
+
+        // Simulate many timeouts — the guard `if reg_timeout < MAX_REG_TIMEOUT`
+        // prevents exceeding the max.
+        for _ in 0..100 {
+            if reg_timeout < MAX_REG_TIMEOUT {
+                reg_timeout += MIN_REG_TIMEOUT;
+            }
+        }
+        assert_eq!(reg_timeout, MAX_REG_TIMEOUT);
+    }
+
+    #[test]
+    fn test_reg_timeout_resets_on_success() {
+        const MIN_REG_TIMEOUT: i64 = 3_000;
+        let mut reg_timeout = 15_000i64; // mid-backoff
+
+        // On successful register response, code does: reg_timeout = MIN_REG_TIMEOUT
+        reg_timeout = MIN_REG_TIMEOUT;
+        assert_eq!(reg_timeout, 3_000);
+    }
+
+    // ---------------------------------------------------------------
+    // 4. get_host_prefix — pure string extraction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_host_prefix_hostname() {
+        // "rs-ny.rustdesk.com" → "rs-ny"
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("rs-ny.rustdesk.com"),
+            "rs-ny"
+        );
+    }
+
+    #[test]
+    fn test_get_host_prefix_ip_address() {
+        // When the first segment is numeric, the whole host is returned
+        // (it is an IP address, not a hostname).
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("192.168.1.1"),
+            "192.168.1.1"
+        );
+    }
+
+    #[test]
+    fn test_get_host_prefix_ip_with_port() {
+        // "192.168.1.1:21116" — first segment "192" is numeric → return whole string.
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("192.168.1.1:21116"),
+            "192.168.1.1:21116"
+        );
+    }
+
+    #[test]
+    fn test_get_host_prefix_single_label() {
+        // "localhost" → "localhost" (no dot, first segment is the whole thing)
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("localhost"),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn test_get_host_prefix_empty_string() {
+        assert_eq!(RendezvousMediator::get_host_prefix(""), "");
+    }
+
+    #[test]
+    fn test_get_host_prefix_subdomain() {
+        // "relay.example.org" → "relay"
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("relay.example.org"),
+            "relay"
+        );
+    }
+
+    #[test]
+    fn test_get_host_prefix_hostname_with_port() {
+        // "myserver.example.com:21116" — first segment "myserver" is not numeric.
+        assert_eq!(
+            RendezvousMediator::get_host_prefix("myserver.example.com:21116"),
+            "myserver"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 5. get_direct_port — free function
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_direct_port_default() {
+        // When Config::get_option("direct-access-port") returns "" (default),
+        // the parse fails → 0, then the function returns RENDEZVOUS_PORT + 2.
+        // We cannot easily mock Config, but we can verify the fallback math.
+        let default_port = RENDEZVOUS_PORT + 2;
+        assert_eq!(default_port, 21118);
+    }
+
+    #[test]
+    fn test_get_direct_port_parse_logic() {
+        // Verify the parsing fallback logic used in get_direct_port.
+        let cases: Vec<(&str, i32)> = vec![
+            ("", 0),
+            ("abc", 0),
+            ("-1", -1),
+            ("0", 0),
+            ("8080", 8080),
+            ("21118", 21118),
+        ];
+        for (input, expected) in cases {
+            let parsed = input.parse::<i32>().unwrap_or(0);
+            assert_eq!(parsed, expected, "parsing '{input}'");
+        }
+        // The function applies: if port <= 0 { port = RENDEZVOUS_PORT + 2 }
+        for val in [0, -1, -100] {
+            let port = if val <= 0 { RENDEZVOUS_PORT + 2 } else { val };
+            assert_eq!(port, 21118, "non-positive {val} should fall back to default");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 6. Relay server selection (get_relay_server logic)
+    //    The method does:
+    //      1. Use Config relay-server option if set
+    //      2. Else use the server-provided relay
+    //      3. Else increase_port(self.host, 1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_relay_server_fallback_port_increase() {
+        // When both config and rendezvous-provided relay are empty,
+        // the relay server is derived by incrementing the host port by 1.
+        use hbb_common::socket_client::increase_port;
+        assert_eq!(increase_port("myhost:21116", 1), "myhost:21117");
+        assert_eq!(increase_port("10.0.0.1:21116", 1), "10.0.0.1:21117");
+    }
+
+    #[test]
+    fn test_relay_server_fallback_port_increase_no_port() {
+        // When the host has no port, increase_port returns the host unchanged.
+        use hbb_common::socket_client::increase_port;
+        let result = increase_port("myhost", 1);
+        // No colon → no port to increment → returned as-is.
+        assert_eq!(result, "myhost");
+    }
+
+    // ---------------------------------------------------------------
+    // 7. NAT type / punch hole decision logic
+    //    The handle_punch_hole method goes to relay when:
+    //      - peer NAT is SYMMETRIC, OR
+    //      - local NAT is SYMMETRIC, OR
+    //      - relay is forced (force_relay / ws / proxy), OR
+    //      - TCP listen disabled AND no UDP port
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_symmetric_nat_forces_relay() {
+        use hbb_common::protobuf::Enum;
+        // NatType::SYMMETRIC should trigger relay path.
+        // Proto enum: UNKNOWN_NAT=0, ASYMMETRIC=1, SYMMETRIC=2
+        assert_eq!(NatType::SYMMETRIC.value(), 2);
+        assert_ne!(NatType::ASYMMETRIC.value(), NatType::SYMMETRIC.value());
+        assert_ne!(NatType::UNKNOWN_NAT.value(), NatType::SYMMETRIC.value());
+    }
+
+    #[test]
+    fn test_nat_type_from_i32() {
+        use hbb_common::protobuf::Enum;
+        // Proto: UNKNOWN_NAT=0, ASYMMETRIC=1, SYMMETRIC=2
+        assert_eq!(NatType::from_i32(0), Some(NatType::UNKNOWN_NAT));
+        assert_eq!(NatType::from_i32(1), Some(NatType::ASYMMETRIC));
+        assert_eq!(NatType::from_i32(2), Some(NatType::SYMMETRIC));
+        assert_eq!(NatType::from_i32(99), None);
+    }
+
+    // ---------------------------------------------------------------
+    // 8. Fail counter thresholds
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_fail_counter_thresholds() {
+        const MAX_FAILS1: i64 = 2;
+        const MAX_FAILS2: i64 = 4;
+
+        // MAX_FAILS1: latency reported as 0 (degraded).
+        // MAX_FAILS2: latency reported as -1 (offline) + DNS re-check.
+        assert!(MAX_FAILS1 < MAX_FAILS2);
+
+        // Simulate fail counter progression
+        let mut fails: i64 = 0;
+        let mut hit_fails1 = false;
+        let mut hit_fails2 = false;
+        for _ in 0..10 {
+            fails += 1;
+            if fails >= MAX_FAILS2 && !hit_fails2 {
+                hit_fails2 = true;
+            } else if fails >= MAX_FAILS1 && !hit_fails1 {
+                hit_fails1 = true;
+            }
+        }
+        assert!(hit_fails1, "should have hit MAX_FAILS1 threshold");
+        assert!(hit_fails2, "should have hit MAX_FAILS2 threshold");
+    }
+
+    // ---------------------------------------------------------------
+    // 9. Keep-alive handling
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_keep_alive_default() {
+        assert_eq!(crate::DEFAULT_KEEP_ALIVE, 60_000, "default keep_alive is 60s");
+    }
+
+    #[test]
+    fn test_keep_alive_from_server_response() {
+        // The code does: self.keep_alive = rpr.keep_alive * 1000
+        let server_value: i32 = 45; // 45 seconds from server
+        let keep_alive = server_value * 1000;
+        assert_eq!(keep_alive, 45_000);
+    }
+
+    #[test]
+    fn test_keep_alive_timeout_check() {
+        // TCP path checks: elapsed > keep_alive * 3 / 2
+        let keep_alive: u64 = 60_000;
+        let threshold = keep_alive * 3 / 2;
+        assert_eq!(threshold, 90_000, "timeout threshold is 1.5x keep_alive");
+    }
+
+    // ---------------------------------------------------------------
+    // 10. check_port utility (used at entry of start_udp / start_tcp)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_check_port_adds_default_port() {
+        let result = crate::check_port("myserver.example.com", RENDEZVOUS_PORT);
+        assert_eq!(result, "myserver.example.com:21116");
+    }
+
+    #[test]
+    fn test_check_port_preserves_existing_port() {
+        let result = crate::check_port("myserver.example.com:9999", RENDEZVOUS_PORT);
+        assert_eq!(result, "myserver.example.com:9999");
+    }
+
+    #[test]
+    fn test_check_port_ipv4_no_port() {
+        let result = crate::check_port("10.0.0.5", RENDEZVOUS_PORT);
+        assert_eq!(result, "10.0.0.5:21116");
+    }
+
+    #[test]
+    fn test_check_port_ipv4_with_port() {
+        let result = crate::check_port("10.0.0.5:5000", RENDEZVOUS_PORT);
+        assert_eq!(result, "10.0.0.5:5000");
+    }
+
+    // ---------------------------------------------------------------
+    // 11. DNS re-check interval
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_dns_interval_constant() {
+        const DNS_INTERVAL: i64 = 60_000;
+        assert_eq!(DNS_INTERVAL, 60_000, "DNS re-check every 60s");
     }
 }

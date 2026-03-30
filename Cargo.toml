@@ -41,6 +41,8 @@ unix-file-copy-paste = [
     "clipboard/unix-file-copy-paste",
 ]
 screencapturekit = ["cpal/screencapturekit"]
+libei = []  # Enable libei input for Wayland (replaces clipboard hack). Add "reis" dep when available.
+quic-transport = ["quinn", "rustls", "rcgen"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -83,6 +85,9 @@ totp-rs = { version = "5.4", default-features = false, features = ["gen_secret",
 stunclient = "0.4"
 kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
@@ -230,6 +235,11 @@ os-version = "0.2"
 [dev-dependencies]
 hound = "3.5"
 docopt = "1.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "perf_benchmarks"
+harness = false
 
 [package.metadata.bundle]
 name = "RustDesk"

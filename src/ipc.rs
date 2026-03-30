@@ -15,6 +15,13 @@ use std::{
 #[cfg(not(windows))]
 use std::{fs::File, io::prelude::*};
 
+/// Unix file mode for IPC sockets and related files.
+/// Owner read+write only (0o600). This is a security invariant:
+/// world-writable IPC sockets (0o777) allow any local user to connect
+/// and modify remote-access passwords, configuration, etc. (CWE-732).
+#[cfg(not(windows))]
+const IPC_SOCKET_MODE: u32 = 0o0600;
+
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::plugin::ipc::Plugin;
@@ -441,7 +448,7 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
             #[cfg(not(windows))]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(IPC_SOCKET_MODE)).ok();
                 write_pid(postfix);
             }
             Ok(incoming)
@@ -1058,7 +1065,7 @@ fn write_pid(postfix: &str) {
     let path = get_pid_file(postfix);
     if let Ok(mut file) = File::create(&path) {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0777)).ok();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(IPC_SOCKET_MODE)).ok();
         file.write_all(&std::process::id().to_string().into_bytes())
             .ok();
     }
@@ -1692,9 +1699,1672 @@ pub async fn set_install_option(k: String, v: String) -> ResultType<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    // ---------------------------------------------------------------
+    // Helper: serialize then deserialize, return the round-tripped value
+    // ---------------------------------------------------------------
+    fn round_trip(data: &Data) -> Data {
+        let json = serde_json::to_string(data).expect("serialize failed");
+        serde_json::from_str::<Data>(&json).expect("deserialize failed")
+    }
+
+    fn round_trip_fs(fs: &FS) -> FS {
+        let json = serde_json::to_string(fs).expect("serialize failed");
+        serde_json::from_str::<FS>(&json).expect("deserialize failed")
+    }
+
+    // ===============================================================
+    // 1. Data enum serialization round-trips
+    // ===============================================================
+
+    #[test]
+    fn data_login_round_trip() {
+        let data = Data::Login {
+            id: 42,
+            is_file_transfer: true,
+            is_view_camera: false,
+            is_terminal: false,
+            peer_id: "abc123".into(),
+            name: "Alice".into(),
+            avatar: "avatar.png".into(),
+            authorized: true,
+            port_forward: "".into(),
+            keyboard: true,
+            clipboard: true,
+            audio: false,
+            file: true,
+            file_transfer_enabled: true,
+            restart: false,
+            recording: false,
+            block_input: false,
+            from_switch: false,
+        };
+        let rt = round_trip(&data);
+        match rt {
+            Data::Login {
+                id,
+                is_file_transfer,
+                peer_id,
+                name,
+                authorized,
+                keyboard,
+                clipboard,
+                file,
+                ..
+            } => {
+                assert_eq!(id, 42);
+                assert!(is_file_transfer);
+                assert_eq!(peer_id, "abc123");
+                assert_eq!(name, "Alice");
+                assert!(authorized);
+                assert!(keyboard);
+                assert!(clipboard);
+                assert!(file);
+            }
+            other => panic!("expected Data::Login, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_chat_message_round_trip() {
+        let data = Data::ChatMessage {
+            text: "hello world".into(),
+        };
+        let rt = round_trip(&data);
+        match rt {
+            Data::ChatMessage { text } => assert_eq!(text, "hello world"),
+            other => panic!("expected ChatMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_switch_permission_round_trip() {
+        let data = Data::SwitchPermission {
+            name: "clipboard".into(),
+            enabled: true,
+        };
+        let rt = round_trip(&data);
+        match rt {
+            Data::SwitchPermission { name, enabled } => {
+                assert_eq!(name, "clipboard");
+                assert!(enabled);
+            }
+            other => panic!("expected SwitchPermission, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_system_info_round_trip() {
+        let data = Data::SystemInfo(Some("test info".into()));
+        match round_trip(&data) {
+            Data::SystemInfo(Some(v)) => assert_eq!(v, "test info"),
+            other => panic!("expected SystemInfo(Some), got {:?}", other),
+        }
+
+        let data_none = Data::SystemInfo(None);
+        match round_trip(&data_none) {
+            Data::SystemInfo(None) => {}
+            other => panic!("expected SystemInfo(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_click_time_round_trip() {
+        let data = Data::ClickTime(1234567890);
+        match round_trip(&data) {
+            Data::ClickTime(t) => assert_eq!(t, 1234567890),
+            other => panic!("expected ClickTime, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_online_status_round_trip() {
+        let data = Data::OnlineStatus(Some((99, true)));
+        match round_trip(&data) {
+            Data::OnlineStatus(Some((ts, confirmed))) => {
+                assert_eq!(ts, 99);
+                assert!(confirmed);
+            }
+            other => panic!("expected OnlineStatus, got {:?}", other),
+        }
+
+        let data_none = Data::OnlineStatus(None);
+        match round_trip(&data_none) {
+            Data::OnlineStatus(None) => {}
+            other => panic!("expected OnlineStatus(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_config_round_trip() {
+        // Config get request (value = None)
+        let data = Data::Config(("id".into(), None));
+        match round_trip(&data) {
+            Data::Config((name, value)) => {
+                assert_eq!(name, "id");
+                assert!(value.is_none());
+            }
+            other => panic!("expected Config, got {:?}", other),
+        }
+
+        // Config set request (value = Some)
+        let data = Data::Config(("id".into(), Some("my-id-123".into())));
+        match round_trip(&data) {
+            Data::Config((name, value)) => {
+                assert_eq!(name, "id");
+                assert_eq!(value.unwrap(), "my-id-123");
+            }
+            other => panic!("expected Config, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_options_round_trip() {
+        let mut opts = HashMap::new();
+        opts.insert("enable-tunnel".into(), "Y".into());
+        opts.insert("enable-lan-discovery".into(), "N".into());
+        let data = Data::Options(Some(opts.clone()));
+        match round_trip(&data) {
+            Data::Options(Some(v)) => {
+                assert_eq!(v.get("enable-tunnel").map(|s| s.as_str()), Some("Y"));
+                assert_eq!(
+                    v.get("enable-lan-discovery").map(|s| s.as_str()),
+                    Some("N")
+                );
+                assert_eq!(v.len(), 2);
+            }
+            other => panic!("expected Options(Some), got {:?}", other),
+        }
+
+        let data_none = Data::Options(None);
+        match round_trip(&data_none) {
+            Data::Options(None) => {}
+            other => panic!("expected Options(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_nat_type_round_trip() {
+        let data = Data::NatType(Some(2));
+        match round_trip(&data) {
+            Data::NatType(Some(v)) => assert_eq!(v, 2),
+            other => panic!("expected NatType(Some(2)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_confirmed_key_round_trip() {
+        let sk = vec![1u8, 2, 3, 4];
+        let pk = vec![5u8, 6, 7, 8];
+        let data = Data::ConfirmedKey(Some((sk.clone(), pk.clone())));
+        match round_trip(&data) {
+            Data::ConfirmedKey(Some((s, p))) => {
+                assert_eq!(s, sk);
+                assert_eq!(p, pk);
+            }
+            other => panic!("expected ConfirmedKey, got {:?}", other),
+        }
+
+        let data_none = Data::ConfirmedKey(None);
+        match round_trip(&data_none) {
+            Data::ConfirmedKey(None) => {}
+            other => panic!("expected ConfirmedKey(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_raw_message_round_trip() {
+        let data = Data::RawMessage(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        match round_trip(&data) {
+            Data::RawMessage(v) => assert_eq!(v, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            other => panic!("expected RawMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_unit_variants_round_trip() {
+        // Test all unit-like variants
+        for data in [
+            Data::Authorize,
+            Data::Close,
+            Data::Test,
+            Data::TestRendezvousServer,
+            Data::Empty,
+            Data::Disconnected,
+            Data::SwitchSidesBack,
+            Data::VoiceCallIncoming,
+            Data::StartVoiceCall,
+            Data::CheckHwcodec,
+            Data::ClearTrustedDevices,
+        ] {
+            let json = serde_json::to_string(&data).expect("serialize");
+            let rt = serde_json::from_str::<Data>(&json).expect("deserialize");
+            // Verify tag matches by re-serializing
+            assert_eq!(
+                serde_json::to_string(&rt).unwrap(),
+                json,
+                "round-trip mismatch for {:?}",
+                data
+            );
+        }
+    }
+
+    #[test]
+    fn data_socks_round_trip() {
+        let socks = config::Socks5Server {
+            proxy: "socks5://127.0.0.1:1080".into(),
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        let data = Data::Socks(Some(socks));
+        match round_trip(&data) {
+            Data::Socks(Some(s)) => {
+                assert_eq!(s.proxy, "socks5://127.0.0.1:1080");
+                assert_eq!(s.username, "user");
+                assert_eq!(s.password, "pass");
+            }
+            other => panic!("expected Socks(Some), got {:?}", other),
+        }
+
+        let data_none = Data::Socks(None);
+        match round_trip(&data_none) {
+            Data::Socks(None) => {}
+            other => panic!("expected Socks(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_privacy_mode_state_round_trip() {
+        let data = Data::PrivacyModeState((5, PrivacyModeState::OffByPeer, "mag".into()));
+        match round_trip(&data) {
+            Data::PrivacyModeState((conn_id, state, key)) => {
+                assert_eq!(conn_id, 5);
+                assert!(matches!(state, PrivacyModeState::OffByPeer));
+                assert_eq!(key, "mag");
+            }
+            other => panic!("expected PrivacyModeState, got {:?}", other),
+        }
+
+        // Test all three PrivacyModeState variants
+        for state in [
+            PrivacyModeState::OffSucceeded,
+            PrivacyModeState::OffByPeer,
+            PrivacyModeState::OffUnknown,
+        ] {
+            let data = Data::PrivacyModeState((0, state.clone(), "test".into()));
+            let json = serde_json::to_string(&data).unwrap();
+            let rt = serde_json::from_str::<Data>(&json).unwrap();
+            match rt {
+                Data::PrivacyModeState((_, _, _)) => {} // just verify it round-trips
+                _ => panic!("PrivacyModeState variant failed round-trip"),
+            }
+        }
+    }
+
+    #[test]
+    fn data_theme_language_round_trip() {
+        let data = Data::Theme("dark".into());
+        match round_trip(&data) {
+            Data::Theme(v) => assert_eq!(v, "dark"),
+            other => panic!("expected Theme, got {:?}", other),
+        }
+
+        let data = Data::Language("en_US".into());
+        match round_trip(&data) {
+            Data::Language(v) => assert_eq!(v, "en_US"),
+            other => panic!("expected Language, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_voice_call_round_trip() {
+        let data = Data::VoiceCallResponse(true);
+        match round_trip(&data) {
+            Data::VoiceCallResponse(v) => assert!(v),
+            other => panic!("expected VoiceCallResponse, got {:?}", other),
+        }
+
+        let data = Data::CloseVoiceCall("reason".into());
+        match round_trip(&data) {
+            Data::CloseVoiceCall(v) => assert_eq!(v, "reason"),
+            other => panic!("expected CloseVoiceCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_url_link_round_trip() {
+        let data = Data::UrlLink("rustdesk://connect/123456".into());
+        match round_trip(&data) {
+            Data::UrlLink(v) => assert_eq!(v, "rustdesk://connect/123456"),
+            other => panic!("expected UrlLink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_switch_sides_request_round_trip() {
+        let data = Data::SwitchSidesRequest("some-uuid".into());
+        match round_trip(&data) {
+            Data::SwitchSidesRequest(v) => assert_eq!(v, "some-uuid"),
+            other => panic!("expected SwitchSidesRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_clipboard_file_enabled_round_trip() {
+        let data = Data::ClipboardFileEnabled(true);
+        match round_trip(&data) {
+            Data::ClipboardFileEnabled(v) => assert!(v),
+            other => panic!("expected ClipboardFileEnabled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_file_transfer_log_round_trip() {
+        let data = Data::FileTransferLog(("peer123".into(), "/tmp/file.txt".into()));
+        match round_trip(&data) {
+            Data::FileTransferLog((peer, path)) => {
+                assert_eq!(peer, "peer123");
+                assert_eq!(path, "/tmp/file.txt");
+            }
+            other => panic!("expected FileTransferLog, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_cm_err_round_trip() {
+        let data = Data::CmErr("something went wrong".into());
+        match round_trip(&data) {
+            Data::CmErr(msg) => assert_eq!(msg, "something went wrong"),
+            other => panic!("expected CmErr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_user_sid_round_trip() {
+        let data = Data::UserSid(Some(1001));
+        match round_trip(&data) {
+            Data::UserSid(Some(v)) => assert_eq!(v, 1001),
+            other => panic!("expected UserSid(Some), got {:?}", other),
+        }
+
+        let data_none = Data::UserSid(None);
+        match round_trip(&data_none) {
+            Data::UserSid(None) => {}
+            other => panic!("expected UserSid(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_wayland_screencast_restore_token_round_trip() {
+        let data = Data::WaylandScreencastRestoreToken(("key1".into(), "token-val".into()));
+        match round_trip(&data) {
+            Data::WaylandScreencastRestoreToken((k, v)) => {
+                assert_eq!(k, "key1");
+                assert_eq!(v, "token-val");
+            }
+            other => panic!("expected WaylandScreencastRestoreToken, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_hwcodec_config_round_trip() {
+        let data = Data::HwCodecConfig(Some("{\"encoders\":[]}".into()));
+        match round_trip(&data) {
+            Data::HwCodecConfig(Some(v)) => assert_eq!(v, "{\"encoders\":[]}"),
+            other => panic!("expected HwCodecConfig(Some), got {:?}", other),
+        }
+
+        let data_none = Data::HwCodecConfig(None);
+        match round_trip(&data_none) {
+            Data::HwCodecConfig(None) => {}
+            other => panic!("expected HwCodecConfig(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_remove_trusted_devices_round_trip() {
+        let hwids = vec![Bytes::from(vec![1, 2, 3]), Bytes::from(vec![4, 5, 6])];
+        let data = Data::RemoveTrustedDevices(hwids.clone());
+        match round_trip(&data) {
+            Data::RemoveTrustedDevices(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[0].as_ref(), &[1, 2, 3]);
+                assert_eq!(v[1].as_ref(), &[4, 5, 6]);
+            }
+            other => panic!("expected RemoveTrustedDevices, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_install_option_round_trip() {
+        let data = Data::InstallOption(Some(("key".into(), "value".into())));
+        match round_trip(&data) {
+            Data::InstallOption(Some((k, v))) => {
+                assert_eq!(k, "key");
+                assert_eq!(v, "value");
+            }
+            other => panic!("expected InstallOption(Some), got {:?}", other),
+        }
+
+        let data_none = Data::InstallOption(None);
+        match round_trip(&data_none) {
+            Data::InstallOption(None) => {}
+            other => panic!("expected InstallOption(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_socks_ws_round_trip() {
+        let socks = config::Socks5Server {
+            proxy: "socks5://10.0.0.1:1080".into(),
+            username: "".into(),
+            password: "".into(),
+        };
+        let data = Data::SocksWs(Some(Box::new((Some(socks), "Y".into()))));
+        match round_trip(&data) {
+            Data::SocksWs(Some(inner)) => {
+                let (s, ws) = *inner;
+                assert_eq!(s.unwrap().proxy, "socks5://10.0.0.1:1080");
+                assert_eq!(ws, "Y");
+            }
+            other => panic!("expected SocksWs(Some), got {:?}", other),
+        }
+
+        let data_none = Data::SocksWs(None);
+        match round_trip(&data_none) {
+            Data::SocksWs(None) => {}
+            other => panic!("expected SocksWs(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_control_permissions_remote_modify_round_trip() {
+        let data = Data::ControlPermissionsRemoteModify(Some(true));
+        match round_trip(&data) {
+            Data::ControlPermissionsRemoteModify(Some(v)) => assert!(v),
+            other => panic!(
+                "expected ControlPermissionsRemoteModify(Some(true)), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ===============================================================
+    // 2. FS enum serialization round-trips
+    // ===============================================================
+
+    #[test]
+    fn fs_read_dir_round_trip() {
+        let fs = FS::ReadDir {
+            dir: "/home/user".into(),
+            include_hidden: true,
+        };
+        match round_trip_fs(&fs) {
+            FS::ReadDir {
+                dir,
+                include_hidden,
+            } => {
+                assert_eq!(dir, "/home/user");
+                assert!(include_hidden);
+            }
+            other => panic!("expected ReadDir, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_read_empty_dirs_round_trip() {
+        let fs = FS::ReadEmptyDirs {
+            dir: "/tmp".into(),
+            include_hidden: false,
+        };
+        match round_trip_fs(&fs) {
+            FS::ReadEmptyDirs {
+                dir,
+                include_hidden,
+            } => {
+                assert_eq!(dir, "/tmp");
+                assert!(!include_hidden);
+            }
+            other => panic!("expected ReadEmptyDirs, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_remove_dir_round_trip() {
+        let fs = FS::RemoveDir {
+            path: "/tmp/test".into(),
+            id: 7,
+            recursive: true,
+        };
+        match round_trip_fs(&fs) {
+            FS::RemoveDir {
+                path,
+                id,
+                recursive,
+            } => {
+                assert_eq!(path, "/tmp/test");
+                assert_eq!(id, 7);
+                assert!(recursive);
+            }
+            other => panic!("expected RemoveDir, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_remove_file_round_trip() {
+        let fs = FS::RemoveFile {
+            path: "/tmp/file.txt".into(),
+            id: 3,
+            file_num: 1,
+        };
+        match round_trip_fs(&fs) {
+            FS::RemoveFile {
+                path,
+                id,
+                file_num,
+            } => {
+                assert_eq!(path, "/tmp/file.txt");
+                assert_eq!(id, 3);
+                assert_eq!(file_num, 1);
+            }
+            other => panic!("expected RemoveFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_create_dir_round_trip() {
+        let fs = FS::CreateDir {
+            path: "/tmp/newdir".into(),
+            id: 10,
+        };
+        match round_trip_fs(&fs) {
+            FS::CreateDir { path, id } => {
+                assert_eq!(path, "/tmp/newdir");
+                assert_eq!(id, 10);
+            }
+            other => panic!("expected CreateDir, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_new_write_round_trip() {
+        let fs = FS::NewWrite {
+            path: "/tmp/upload".into(),
+            id: 1,
+            file_num: 0,
+            files: vec![("file1.txt".into(), 1024), ("file2.txt".into(), 2048)],
+            overwrite_detection: true,
+            total_size: 3072,
+            conn_id: 42,
+        };
+        match round_trip_fs(&fs) {
+            FS::NewWrite {
+                path,
+                id,
+                file_num,
+                files,
+                overwrite_detection,
+                total_size,
+                conn_id,
+            } => {
+                assert_eq!(path, "/tmp/upload");
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 0);
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0], ("file1.txt".into(), 1024));
+                assert_eq!(files[1], ("file2.txt".into(), 2048));
+                assert!(overwrite_detection);
+                assert_eq!(total_size, 3072);
+                assert_eq!(conn_id, 42);
+            }
+            other => panic!("expected NewWrite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_cancel_write_round_trip() {
+        let fs = FS::CancelWrite { id: 99 };
+        match round_trip_fs(&fs) {
+            FS::CancelWrite { id } => assert_eq!(id, 99),
+            other => panic!("expected CancelWrite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_write_block_round_trip() {
+        let fs = FS::WriteBlock {
+            id: 1,
+            file_num: 0,
+            data: Bytes::from(vec![0xAA, 0xBB, 0xCC]),
+            compressed: true,
+        };
+        match round_trip_fs(&fs) {
+            FS::WriteBlock {
+                id,
+                file_num,
+                data,
+                compressed,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 0);
+                assert_eq!(data.as_ref(), &[0xAA, 0xBB, 0xCC]);
+                assert!(compressed);
+            }
+            other => panic!("expected WriteBlock, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_write_done_round_trip() {
+        let fs = FS::WriteDone {
+            id: 5,
+            file_num: 3,
+        };
+        match round_trip_fs(&fs) {
+            FS::WriteDone { id, file_num } => {
+                assert_eq!(id, 5);
+                assert_eq!(file_num, 3);
+            }
+            other => panic!("expected WriteDone, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_write_error_round_trip() {
+        let fs = FS::WriteError {
+            id: 2,
+            file_num: 1,
+            err: "disk full".into(),
+        };
+        match round_trip_fs(&fs) {
+            FS::WriteError {
+                id,
+                file_num,
+                err,
+            } => {
+                assert_eq!(id, 2);
+                assert_eq!(file_num, 1);
+                assert_eq!(err, "disk full");
+            }
+            other => panic!("expected WriteError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_write_offset_round_trip() {
+        let fs = FS::WriteOffset {
+            id: 1,
+            file_num: 0,
+            offset_blk: 512,
+        };
+        match round_trip_fs(&fs) {
+            FS::WriteOffset {
+                id,
+                file_num,
+                offset_blk,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 0);
+                assert_eq!(offset_blk, 512);
+            }
+            other => panic!("expected WriteOffset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_check_digest_round_trip() {
+        let fs = FS::CheckDigest {
+            id: 3,
+            file_num: 2,
+            file_size: 999999,
+            last_modified: 1700000000,
+            is_upload: true,
+            is_resume: false,
+        };
+        match round_trip_fs(&fs) {
+            FS::CheckDigest {
+                id,
+                file_num,
+                file_size,
+                last_modified,
+                is_upload,
+                is_resume,
+            } => {
+                assert_eq!(id, 3);
+                assert_eq!(file_num, 2);
+                assert_eq!(file_size, 999999);
+                assert_eq!(last_modified, 1700000000);
+                assert!(is_upload);
+                assert!(!is_resume);
+            }
+            other => panic!("expected CheckDigest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_send_confirm_round_trip() {
+        let fs = FS::SendConfirm(vec![1, 2, 3, 4, 5]);
+        match round_trip_fs(&fs) {
+            FS::SendConfirm(v) => assert_eq!(v, vec![1, 2, 3, 4, 5]),
+            other => panic!("expected SendConfirm, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_rename_round_trip() {
+        let fs = FS::Rename {
+            id: 1,
+            path: "/tmp/old.txt".into(),
+            new_name: "new.txt".into(),
+        };
+        match round_trip_fs(&fs) {
+            FS::Rename { id, path, new_name } => {
+                assert_eq!(id, 1);
+                assert_eq!(path, "/tmp/old.txt");
+                assert_eq!(new_name, "new.txt");
+            }
+            other => panic!("expected Rename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_read_file_round_trip() {
+        let fs = FS::ReadFile {
+            path: "/tmp/read.txt".into(),
+            id: 10,
+            file_num: 0,
+            include_hidden: false,
+            conn_id: 5,
+            overwrite_detection: true,
+        };
+        match round_trip_fs(&fs) {
+            FS::ReadFile {
+                path,
+                id,
+                file_num,
+                include_hidden,
+                conn_id,
+                overwrite_detection,
+            } => {
+                assert_eq!(path, "/tmp/read.txt");
+                assert_eq!(id, 10);
+                assert_eq!(file_num, 0);
+                assert!(!include_hidden);
+                assert_eq!(conn_id, 5);
+                assert!(overwrite_detection);
+            }
+            other => panic!("expected ReadFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_cancel_read_round_trip() {
+        let fs = FS::CancelRead {
+            id: 7,
+            conn_id: 3,
+        };
+        match round_trip_fs(&fs) {
+            FS::CancelRead { id, conn_id } => {
+                assert_eq!(id, 7);
+                assert_eq!(conn_id, 3);
+            }
+            other => panic!("expected CancelRead, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_send_confirm_for_read_round_trip() {
+        let fs = FS::SendConfirmForRead {
+            id: 1,
+            file_num: 2,
+            skip: true,
+            offset_blk: 100,
+            conn_id: 9,
+        };
+        match round_trip_fs(&fs) {
+            FS::SendConfirmForRead {
+                id,
+                file_num,
+                skip,
+                offset_blk,
+                conn_id,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 2);
+                assert!(skip);
+                assert_eq!(offset_blk, 100);
+                assert_eq!(conn_id, 9);
+            }
+            other => panic!("expected SendConfirmForRead, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_read_all_files_round_trip() {
+        let fs = FS::ReadAllFiles {
+            path: "/home".into(),
+            id: 4,
+            include_hidden: true,
+            conn_id: 2,
+        };
+        match round_trip_fs(&fs) {
+            FS::ReadAllFiles {
+                path,
+                id,
+                include_hidden,
+                conn_id,
+            } => {
+                assert_eq!(path, "/home");
+                assert_eq!(id, 4);
+                assert!(include_hidden);
+                assert_eq!(conn_id, 2);
+            }
+            other => panic!("expected ReadAllFiles, got {:?}", other),
+        }
+    }
+
+    // FS wrapped in Data::FS
+    #[test]
+    fn data_fs_round_trip() {
+        let data = Data::FS(FS::ReadDir {
+            dir: "/var".into(),
+            include_hidden: false,
+        });
+        match round_trip(&data) {
+            Data::FS(FS::ReadDir {
+                dir,
+                include_hidden,
+            }) => {
+                assert_eq!(dir, "/var");
+                assert!(!include_hidden);
+            }
+            other => panic!("expected Data::FS(ReadDir), got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // 3. DataKeyboard / DataKeyboardResponse / DataMouse / DataControl
+    // ===============================================================
+
+    #[test]
+    fn data_keyboard_sequence_round_trip() {
+        let dk = DataKeyboard::Sequence("hello".into());
+        let json = serde_json::to_string(&dk).unwrap();
+        let rt: DataKeyboard = serde_json::from_str(&json).unwrap();
+        match rt {
+            DataKeyboard::Sequence(s) => assert_eq!(s, "hello"),
+            other => panic!("expected Sequence, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_keyboard_key_variants_round_trip() {
+        // Test KeyDown, KeyUp, KeyClick with a representative key
+        for (variant_name, dk) in [
+            ("KeyDown", DataKeyboard::KeyDown(enigo::Key::Return)),
+            ("KeyUp", DataKeyboard::KeyUp(enigo::Key::Alt)),
+            ("KeyClick", DataKeyboard::KeyClick(enigo::Key::Tab)),
+            (
+                "GetKeyState",
+                DataKeyboard::GetKeyState(enigo::Key::CapsLock),
+            ),
+        ] {
+            let json = serde_json::to_string(&dk).unwrap();
+            let rt: DataKeyboard = serde_json::from_str(&json).unwrap();
+            let json_rt = serde_json::to_string(&rt).unwrap();
+            assert_eq!(json, json_rt, "round-trip mismatch for {}", variant_name);
+        }
+    }
+
+    #[test]
+    fn data_keyboard_response_round_trip() {
+        let resp = DataKeyboardResponse::GetKeyState(true);
+        let json = serde_json::to_string(&resp).unwrap();
+        let rt: DataKeyboardResponse = serde_json::from_str(&json).unwrap();
+        match rt {
+            DataKeyboardResponse::GetKeyState(v) => assert!(v),
+        }
+
+        let resp_false = DataKeyboardResponse::GetKeyState(false);
+        let json = serde_json::to_string(&resp_false).unwrap();
+        let rt: DataKeyboardResponse = serde_json::from_str(&json).unwrap();
+        match rt {
+            DataKeyboardResponse::GetKeyState(v) => assert!(!v),
+        }
+    }
+
+    #[test]
+    fn data_mouse_variants_round_trip() {
+        let variants: Vec<DataMouse> = vec![
+            DataMouse::MoveTo(100, 200),
+            DataMouse::MoveRelative(-5, 10),
+            DataMouse::Down(enigo::MouseButton::Left),
+            DataMouse::Up(enigo::MouseButton::Right),
+            DataMouse::Click(enigo::MouseButton::Middle),
+            DataMouse::ScrollX(3),
+            DataMouse::ScrollY(-5),
+            DataMouse::Refresh,
+        ];
+        for dm in &variants {
+            let json = serde_json::to_string(dm).unwrap();
+            let rt: DataMouse = serde_json::from_str(&json).unwrap();
+            let json_rt = serde_json::to_string(&rt).unwrap();
+            assert_eq!(json, json_rt, "round-trip mismatch for {:?}", dm);
+        }
+    }
+
+    #[test]
+    fn data_control_resolution_round_trip() {
+        let dc = DataControl::Resolution {
+            minx: 0,
+            maxx: 1920,
+            miny: 0,
+            maxy: 1080,
+        };
+        let json = serde_json::to_string(&dc).unwrap();
+        let rt: DataControl = serde_json::from_str(&json).unwrap();
+        match rt {
+            DataControl::Resolution {
+                minx,
+                maxx,
+                miny,
+                maxy,
+            } => {
+                assert_eq!(minx, 0);
+                assert_eq!(maxx, 1920);
+                assert_eq!(miny, 0);
+                assert_eq!(maxy, 1080);
+            }
+        }
+    }
+
+    // ===============================================================
+    // 4. DataPortableService serialization round-trips
+    // ===============================================================
+
+    #[test]
+    fn data_portable_service_round_trip() {
+        let variants: Vec<DataPortableService> = vec![
+            DataPortableService::Ping,
+            DataPortableService::Pong,
+            DataPortableService::ConnCount(Some(5)),
+            DataPortableService::ConnCount(None),
+            DataPortableService::RequestStart,
+            DataPortableService::WillClose,
+            DataPortableService::CmShowElevation(true),
+            DataPortableService::CmShowElevation(false),
+            DataPortableService::Key(vec![1, 2, 3]),
+            DataPortableService::Pointer((vec![4, 5], 10)),
+            DataPortableService::Mouse((vec![6, 7], 20, "test".into(), 3, true, false)),
+        ];
+        for dps in &variants {
+            let json = serde_json::to_string(dps).unwrap();
+            let rt: DataPortableService = serde_json::from_str(&json).unwrap();
+            let json_rt = serde_json::to_string(&rt).unwrap();
+            assert_eq!(json, json_rt, "round-trip mismatch for {:?}", dps);
+        }
+    }
+
+    #[test]
+    fn data_portable_service_wrapped_round_trip() {
+        let data = Data::DataPortableService(DataPortableService::Ping);
+        match round_trip(&data) {
+            Data::DataPortableService(DataPortableService::Ping) => {}
+            other => panic!(
+                "expected Data::DataPortableService(Ping), got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ===============================================================
+    // 5. CM-side file reading structs serialization
+    // ===============================================================
+
+    #[test]
+    fn data_read_job_init_result_round_trip() {
+        // Success case
+        let data = Data::ReadJobInitResult {
+            id: 1,
+            file_num: 0,
+            include_hidden: true,
+            conn_id: 42,
+            result: Ok(vec![10, 20, 30]),
+        };
+        match round_trip(&data) {
+            Data::ReadJobInitResult {
+                id,
+                file_num,
+                include_hidden,
+                conn_id,
+                result,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 0);
+                assert!(include_hidden);
+                assert_eq!(conn_id, 42);
+                assert_eq!(result.unwrap(), vec![10, 20, 30]);
+            }
+            other => panic!("expected ReadJobInitResult, got {:?}", other),
+        }
+
+        // Error case
+        let data = Data::ReadJobInitResult {
+            id: 2,
+            file_num: 1,
+            include_hidden: false,
+            conn_id: 10,
+            result: Err("file not found".into()),
+        };
+        match round_trip(&data) {
+            Data::ReadJobInitResult { result, .. } => {
+                assert_eq!(result.unwrap_err(), "file not found");
+            }
+            other => panic!("expected ReadJobInitResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_file_block_from_cm_serde_skip_data() {
+        // FileBlockFromCM has #[serde(skip)] on the `data` field.
+        // After round-trip, data should be empty (default Bytes).
+        let data = Data::FileBlockFromCM {
+            id: 5,
+            file_num: 2,
+            data: Bytes::from(vec![0xAA, 0xBB]),
+            compressed: true,
+            conn_id: 7,
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        // Verify the JSON does NOT contain the data bytes
+        assert!(
+            !json.contains("0xAA") && !json.contains("170"),
+            "serde(skip) should omit data field from JSON, but got: {}",
+            json
+        );
+
+        let rt: Data = serde_json::from_str(&json).unwrap();
+        match rt {
+            Data::FileBlockFromCM {
+                id,
+                file_num,
+                data,
+                compressed,
+                conn_id,
+            } => {
+                assert_eq!(id, 5);
+                assert_eq!(file_num, 2);
+                assert!(data.is_empty(), "serde(skip) should produce empty Bytes");
+                assert!(compressed);
+                assert_eq!(conn_id, 7);
+            }
+            other => panic!("expected FileBlockFromCM, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_file_read_done_round_trip() {
+        let data = Data::FileReadDone {
+            id: 1,
+            file_num: 3,
+            conn_id: 10,
+        };
+        match round_trip(&data) {
+            Data::FileReadDone {
+                id,
+                file_num,
+                conn_id,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(file_num, 3);
+                assert_eq!(conn_id, 10);
+            }
+            other => panic!("expected FileReadDone, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_file_read_error_round_trip() {
+        let data = Data::FileReadError {
+            id: 2,
+            file_num: 1,
+            err: "permission denied".into(),
+            conn_id: 8,
+        };
+        match round_trip(&data) {
+            Data::FileReadError {
+                id,
+                file_num,
+                err,
+                conn_id,
+            } => {
+                assert_eq!(id, 2);
+                assert_eq!(file_num, 1);
+                assert_eq!(err, "permission denied");
+                assert_eq!(conn_id, 8);
+            }
+            other => panic!("expected FileReadError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_file_digest_from_cm_round_trip() {
+        let data = Data::FileDigestFromCM {
+            id: 3,
+            file_num: 2,
+            last_modified: 1700000000,
+            file_size: 65536,
+            is_resume: true,
+            conn_id: 11,
+        };
+        match round_trip(&data) {
+            Data::FileDigestFromCM {
+                id,
+                file_num,
+                last_modified,
+                file_size,
+                is_resume,
+                conn_id,
+            } => {
+                assert_eq!(id, 3);
+                assert_eq!(file_num, 2);
+                assert_eq!(last_modified, 1700000000);
+                assert_eq!(file_size, 65536);
+                assert!(is_resume);
+                assert_eq!(conn_id, 11);
+            }
+            other => panic!("expected FileDigestFromCM, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_all_files_result_round_trip() {
+        let data = Data::AllFilesResult {
+            id: 1,
+            conn_id: 5,
+            path: "/home/user/docs".into(),
+            result: Ok(vec![99, 100]),
+        };
+        match round_trip(&data) {
+            Data::AllFilesResult {
+                id,
+                conn_id,
+                path,
+                result,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(conn_id, 5);
+                assert_eq!(path, "/home/user/docs");
+                assert_eq!(result.unwrap(), vec![99, 100]);
+            }
+            other => panic!("expected AllFilesResult, got {:?}", other),
+        }
+
+        // Error case
+        let data = Data::AllFilesResult {
+            id: 2,
+            conn_id: 6,
+            path: "/nonexistent".into(),
+            result: Err("not found".into()),
+        };
+        match round_trip(&data) {
+            Data::AllFilesResult { result, .. } => {
+                assert_eq!(result.unwrap_err(), "not found");
+            }
+            other => panic!("expected AllFilesResult, got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // 6. JSON tag structure verification (serde(tag = "t", content = "c"))
+    // ===============================================================
+
+    #[test]
+    fn data_json_uses_tag_t_and_content_c() {
+        let data = Data::ChatMessage {
+            text: "hi".into(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // The adjacently-tagged repr should use "t" for the variant tag
+        assert_eq!(parsed["t"], "ChatMessage");
+        // and "c" for the content
+        assert!(parsed["c"].is_object(), "content should be an object");
+        assert_eq!(parsed["c"]["text"], "hi");
+    }
+
+    #[test]
+    fn data_unit_variant_json_has_no_content() {
+        let data = Data::Authorize;
+        let json = serde_json::to_string(&data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["t"], "Authorize");
+        // Unit variants have no "c" field
+        assert!(parsed.get("c").is_none());
+    }
+
+    #[test]
+    fn fs_json_uses_tag_t_and_content_c() {
+        let fs = FS::CreateDir {
+            path: "/tmp".into(),
+            id: 1,
+        };
+        let json = serde_json::to_string(&fs).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["t"], "CreateDir");
+        assert_eq!(parsed["c"]["path"], "/tmp");
+        assert_eq!(parsed["c"]["id"], 1);
+    }
+
+    // ===============================================================
+    // 7. Cross-deserialization: Data from raw JSON strings
+    // ===============================================================
+
+    #[test]
+    fn data_deserialize_from_handcrafted_json() {
+        // Simulate what the IPC wire format looks like
+        let json = r#"{"t":"Config","c":["my-key",null]}"#;
+        let data: Data = serde_json::from_str(json).unwrap();
+        match data {
+            Data::Config((name, value)) => {
+                assert_eq!(name, "my-key");
+                assert!(value.is_none());
+            }
+            other => panic!("expected Config, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_deserialize_config_with_value_from_json() {
+        let json = r#"{"t":"Config","c":["id","abc123"]}"#;
+        let data: Data = serde_json::from_str(json).unwrap();
+        match data {
+            Data::Config((name, value)) => {
+                assert_eq!(name, "id");
+                assert_eq!(value.unwrap(), "abc123");
+            }
+            other => panic!("expected Config, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_deserialize_options_from_json() {
+        let json = r#"{"t":"Options","c":{"enable-tunnel":"Y","stop-service":""}}"#;
+        let data: Data = serde_json::from_str(json).unwrap();
+        match data {
+            Data::Options(Some(opts)) => {
+                assert_eq!(opts.get("enable-tunnel").map(|s| s.as_str()), Some("Y"));
+                assert_eq!(opts.get("stop-service").map(|s| s.as_str()), Some(""));
+            }
+            other => panic!("expected Options(Some), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_deserialize_nat_type_from_json() {
+        let json = r#"{"t":"NatType","c":1}"#;
+        let data: Data = serde_json::from_str(json).unwrap();
+        match data {
+            Data::NatType(Some(v)) => assert_eq!(v, 1),
+            other => panic!("expected NatType(Some(1)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_deserialize_close_from_json() {
+        let json = r#"{"t":"Close"}"#;
+        let data: Data = serde_json::from_str(json).unwrap();
+        assert!(matches!(data, Data::Close));
+    }
+
+    // ===============================================================
+    // 8. apply_permanent_password_storage_and_salt_payload
+    // ===============================================================
+
+    #[test]
+    fn apply_permanent_password_payload_none_is_ok() {
+        // None payload should succeed without error
+        let result = apply_permanent_password_storage_and_salt_payload(None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn apply_permanent_password_payload_missing_newline_is_err() {
+        // Payload without a newline separator should fail
+        let result = apply_permanent_password_storage_and_salt_payload(Some("no-newline-here"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid"),
+            "error should mention invalid payload, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn apply_permanent_password_payload_empty_storage_is_ok() {
+        // Empty storage (before newline) should succeed -- this clears the password
+        let result = apply_permanent_password_storage_and_salt_payload(Some("\nsome-salt"));
+        assert!(result.is_ok());
+    }
+
+    // ===============================================================
+    // 9. IPC path construction
+    // ===============================================================
+
+    #[test]
+    fn ipc_path_contains_postfix() {
+        let path = Config::ipc_path("");
+        assert!(
+            path.contains("ipc"),
+            "ipc path should contain 'ipc': {}",
+            path
+        );
+
+        let path_service = Config::ipc_path("_service");
+        assert!(
+            path_service.contains("_service"),
+            "ipc path with postfix should contain postfix: {}",
+            path_service
+        );
+    }
+
+    #[test]
+    fn ipc_path_different_postfixes_differ() {
+        let p1 = Config::ipc_path("");
+        let p2 = Config::ipc_path("_cm");
+        let p3 = Config::ipc_path("_url");
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_ne!(p1, p3);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn get_pid_file_path() {
+        let pid_path = get_pid_file("");
+        assert!(
+            pid_path.ends_with(".pid"),
+            "pid file should end with .pid: {}",
+            pid_path
+        );
+        assert!(
+            pid_path.contains("ipc"),
+            "pid file path should contain 'ipc': {}",
+            pid_path
+        );
+
+        let pid_path_svc = get_pid_file("_service");
+        assert!(pid_path_svc.contains("_service"));
+        assert!(pid_path_svc.ends_with(".pid"));
+        assert_ne!(pid_path, pid_path_svc);
+    }
+
+    // ===============================================================
+    // 10. IPC_ACTION_CLOSE constant
+    // ===============================================================
+
+    #[test]
+    fn ipc_action_close_constant() {
+        assert_eq!(IPC_ACTION_CLOSE, "close");
+    }
+
+    // ===============================================================
+    // 11. EXIT_RECV_CLOSE default state
+    // ===============================================================
+
+    #[test]
+    fn exit_recv_close_default_is_true() {
+        // This is the static default; in tests it may have been mutated, so we
+        // just verify it can be read without panic.  The declaration initializes
+        // it to `true`.
+        let _ = EXIT_RECV_CLOSE.load(Ordering::SeqCst);
+    }
+
+    // ===============================================================
+    // 12. Whiteboard/Keyboard/Mouse nested in Data
+    // ===============================================================
+
+    #[test]
+    fn data_keyboard_wrapped_in_data_round_trip() {
+        let data = Data::Keyboard(DataKeyboard::Sequence("test input".into()));
+        match round_trip(&data) {
+            Data::Keyboard(DataKeyboard::Sequence(s)) => assert_eq!(s, "test input"),
+            other => panic!("expected Data::Keyboard(Sequence), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_keyboard_response_wrapped_in_data_round_trip() {
+        let data = Data::KeyboardResponse(DataKeyboardResponse::GetKeyState(false));
+        match round_trip(&data) {
+            Data::KeyboardResponse(DataKeyboardResponse::GetKeyState(v)) => assert!(!v),
+            other => panic!("expected Data::KeyboardResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_mouse_wrapped_in_data_round_trip() {
+        let data = Data::Mouse(DataMouse::MoveTo(500, 300));
+        match round_trip(&data) {
+            Data::Mouse(DataMouse::MoveTo(x, y)) => {
+                assert_eq!(x, 500);
+                assert_eq!(y, 300);
+            }
+            other => panic!("expected Data::Mouse(MoveTo), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_control_wrapped_in_data_round_trip() {
+        let data = Data::Control(DataControl::Resolution {
+            minx: -100,
+            maxx: 3840,
+            miny: -50,
+            maxy: 2160,
+        });
+        match round_trip(&data) {
+            Data::Control(DataControl::Resolution {
+                minx,
+                maxx,
+                miny,
+                maxy,
+            }) => {
+                assert_eq!(minx, -100);
+                assert_eq!(maxx, 3840);
+                assert_eq!(miny, -50);
+                assert_eq!(maxy, 2160);
+            }
+            other => panic!("expected Data::Control(Resolution), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_whiteboard_round_trip() {
+        let data = Data::Whiteboard((
+            "conn-123".into(),
+            crate::whiteboard::CustomEvent::Clear,
+        ));
+        match round_trip(&data) {
+            Data::Whiteboard((id, event)) => {
+                assert_eq!(id, "conn-123");
+                assert!(matches!(event, crate::whiteboard::CustomEvent::Clear));
+            }
+            other => panic!("expected Data::Whiteboard, got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // 13. SyncConfig round-trip (boxed tuple)
+    // ===============================================================
+
+    #[test]
+    fn data_sync_config_none_round_trip() {
+        let data = Data::SyncConfig(None);
+        match round_trip(&data) {
+            Data::SyncConfig(None) => {}
+            other => panic!("expected SyncConfig(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_sync_config_some_round_trip() {
+        let config = Config::default();
+        let config2 = Config2::default();
+        let data = Data::SyncConfig(Some(Box::new((config, config2))));
+        match round_trip(&data) {
+            Data::SyncConfig(Some(_)) => {} // just verify it doesn't panic
+            other => panic!("expected SyncConfig(Some), got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // 14. Malformed/unknown JSON handling
+    // ===============================================================
+
+    #[test]
+    fn data_deserialize_unknown_variant_fails() {
+        let json = r#"{"t":"NonExistentVariant","c":null}"#;
+        let result = serde_json::from_str::<Data>(json);
+        assert!(
+            result.is_err(),
+            "unknown variant should fail deserialization"
+        );
+    }
+
+    #[test]
+    fn data_deserialize_empty_object_fails() {
+        let json = r#"{}"#;
+        let result = serde_json::from_str::<Data>(json);
+        assert!(result.is_err(), "empty object should fail deserialization");
+    }
+
+    #[test]
+    fn data_deserialize_invalid_json_fails() {
+        let result = serde_json::from_str::<Data>("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn data_deserialize_wrong_content_type_fails() {
+        // ChatMessage expects an object with "text" field, not a number
+        let json = r#"{"t":"ChatMessage","c":42}"#;
+        let result = serde_json::from_str::<Data>(json);
+        assert!(
+            result.is_err(),
+            "wrong content type should fail deserialization"
+        );
+    }
+
+    // ===============================================================
+    // 15. Large/edge-case payloads
+    // ===============================================================
+
+    #[test]
+    fn data_raw_message_empty_round_trip() {
+        let data = Data::RawMessage(vec![]);
+        match round_trip(&data) {
+            Data::RawMessage(v) => assert!(v.is_empty()),
+            other => panic!("expected empty RawMessage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_options_empty_hashmap_round_trip() {
+        let data = Data::Options(Some(HashMap::new()));
+        match round_trip(&data) {
+            Data::Options(Some(v)) => assert!(v.is_empty()),
+            other => panic!("expected Options(Some(empty)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fs_new_write_empty_files_round_trip() {
+        let fs = FS::NewWrite {
+            path: "".into(),
+            id: 0,
+            file_num: 0,
+            files: vec![],
+            overwrite_detection: false,
+            total_size: 0,
+            conn_id: 0,
+        };
+        match round_trip_fs(&fs) {
+            FS::NewWrite { files, .. } => assert!(files.is_empty()),
+            other => panic!("expected NewWrite with empty files, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn data_login_unicode_fields_round_trip() {
+        let data = Data::Login {
+            id: 1,
+            is_file_transfer: false,
+            is_view_camera: false,
+            is_terminal: false,
+            peer_id: "peer-\u{1F600}".into(),
+            name: "\u{4F60}\u{597D}".into(), // Chinese characters
+            avatar: "".into(),
+            authorized: false,
+            port_forward: "".into(),
+            keyboard: false,
+            clipboard: false,
+            audio: false,
+            file: false,
+            file_transfer_enabled: false,
+            restart: false,
+            recording: false,
+            block_input: false,
+            from_switch: false,
+        };
+        match round_trip(&data) {
+            Data::Login { peer_id, name, .. } => {
+                assert!(peer_id.contains('\u{1F600}'));
+                assert_eq!(name, "\u{4F60}\u{597D}");
+            }
+            other => panic!("expected Login with unicode, got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // 16. TerminalSessionCount (linux-only variant)
+    // ===============================================================
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn data_terminal_session_count_round_trip() {
+        let data = Data::TerminalSessionCount(7);
+        match round_trip(&data) {
+            Data::TerminalSessionCount(v) => assert_eq!(v, 7),
+            other => panic!("expected TerminalSessionCount, got {:?}", other),
+        }
+    }
+
+    // ===============================================================
+    // Security invariant: IPC socket permissions (CWE-732)
+    // ===============================================================
+
+    /// The IPC socket must NOT be world-writable. A mode of 0o777 would let any
+    /// local user connect and change remote-access passwords, configuration, etc.
+    /// This test ensures IPC_SOCKET_MODE stays at 0o600 (owner read+write only).
+    #[cfg(not(windows))]
+    #[test]
+    fn ipc_socket_mode_is_owner_only() {
+        assert_eq!(
+            IPC_SOCKET_MODE, 0o600,
+            "IPC_SOCKET_MODE must be 0o600 (owner rw only) to prevent local privilege escalation"
+        );
+        // Verify no group or other bits are set
+        assert_eq!(
+            IPC_SOCKET_MODE & 0o077,
+            0,
+            "IPC_SOCKET_MODE must not grant any group or other permissions"
+        );
     }
 }

@@ -1189,35 +1189,21 @@ async fn post_request_(
                 Ok(resp)
             }
             Err(e) => {
-                if (tls_type.is_none() || danger_accept_invalid_cert.is_none()) && e.is_request() {
-                    if danger_accept_invalid_cert.is_none() {
-                        log::warn!(
-                            "HTTP request failed: {:?}, try again, danger accept invalid cert",
-                            e
-                        );
-                        post_request_(
-                            url,
-                            tls_url,
-                            body,
-                            header,
-                            tls_type,
-                            Some(true),
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
-                    } else {
-                        log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
-                        post_request_(
-                            url,
-                            tls_url,
-                            body,
-                            header,
-                            Some(TlsType::NativeTls),
-                            original_danger_accept_invalid_cert,
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
-                    }
+                // Only retry with a different TLS backend if the TLS type was
+                // not yet cached. Never auto-accept invalid certificates on
+                // failure — doing so enables TLS-stripping MITM attacks.
+                if tls_type.is_none() && e.is_request() {
+                    log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
+                    post_request_(
+                        url,
+                        tls_url,
+                        body,
+                        header,
+                        Some(TlsType::NativeTls),
+                        original_danger_accept_invalid_cert,
+                        original_danger_accept_invalid_cert,
+                    )
+                    .await
                 } else {
                     Err(anyhow!("{:?}", e))
                 }
@@ -1301,37 +1287,22 @@ async fn get_http_response_async(
                 Ok(resp)
             }
             Err(e) => {
-                if (tls_type.is_none() || danger_accept_invalid_cert.is_none()) && e.is_request() {
-                    if danger_accept_invalid_cert.is_none() {
-                        log::warn!(
-                            "HTTP request failed: {:?}, try again, danger accept invalid cert",
-                            e
-                        );
-                        get_http_response_async(
-                            url,
-                            tls_url,
-                            method,
-                            body,
-                            header,
-                            tls_type,
-                            Some(true),
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
-                    } else {
-                        log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
-                        get_http_response_async(
-                            url,
-                            tls_url,
-                            method,
-                            body,
-                            header,
-                            Some(TlsType::NativeTls),
-                            original_danger_accept_invalid_cert,
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
-                    }
+                // Only retry with a different TLS backend if the TLS type was
+                // not yet cached. Never auto-accept invalid certificates on
+                // failure — doing so enables TLS-stripping MITM attacks.
+                if tls_type.is_none() && e.is_request() {
+                    log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
+                    get_http_response_async(
+                        url,
+                        tls_url,
+                        method,
+                        body,
+                        header,
+                        Some(TlsType::NativeTls),
+                        original_danger_accept_invalid_cert,
+                        original_danger_accept_invalid_cert,
+                    )
+                    .await
                 } else {
                     Err(anyhow!("{:?}", e))
                 }
@@ -2515,5 +2486,544 @@ mod tests {
         let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
         assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
         assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
+    }
+
+    // --- Version support checks ---
+
+    #[test]
+    fn test_is_support_multi_ui_session() {
+        // MIN_VER_MULTI_UI_SESSION is "1.2.4"
+        assert!(!is_support_multi_ui_session("1.2.3"));
+        assert!(is_support_multi_ui_session("1.2.4"));
+        assert!(is_support_multi_ui_session("1.2.5"));
+        assert!(is_support_multi_ui_session("1.3.0"));
+        assert!(is_support_multi_ui_session("2.0.0"));
+        // Edge: empty or garbage version strings
+        assert!(!is_support_multi_ui_session(""));
+        assert!(!is_support_multi_ui_session("not-a-version"));
+        assert!(!is_support_multi_ui_session("0.0.0"));
+    }
+
+    #[test]
+    fn test_is_support_screenshot() {
+        // is_support_screenshot delegates to is_support_multi_ui_session_num (>= 1.2.4)
+        assert!(!is_support_screenshot("1.2.3"));
+        assert!(is_support_screenshot("1.2.4"));
+        assert!(is_support_screenshot("1.4.0"));
+        assert!(!is_support_screenshot(""));
+    }
+
+    #[test]
+    fn test_is_support_file_transfer_resume() {
+        // Requires >= 1.4.2
+        assert!(!is_support_file_transfer_resume("1.4.1"));
+        assert!(is_support_file_transfer_resume("1.4.2"));
+        assert!(is_support_file_transfer_resume("1.5.0"));
+    }
+
+    #[test]
+    fn test_is_support_relative_mouse_mode() {
+        // MIN_VERSION_RELATIVE_MOUSE_MODE is "1.4.5"
+        assert!(!is_support_relative_mouse_mode("1.4.4"));
+        assert!(is_support_relative_mouse_mode("1.4.5"));
+        assert!(is_support_relative_mouse_mode("1.4.6"));
+        assert!(is_support_relative_mouse_mode("2.0.0"));
+        assert!(!is_support_relative_mouse_mode(""));
+    }
+
+    #[test]
+    fn test_is_support_remote_print() {
+        // Requires >= 1.3.9
+        assert!(!is_support_remote_print("1.3.8"));
+        assert!(is_support_remote_print("1.3.9"));
+        assert!(is_support_remote_print("1.4.0"));
+    }
+
+    // --- is_setup ---
+
+    #[test]
+    fn test_is_setup() {
+        assert!(is_setup("rustdesk-install.exe"));
+        assert!(is_setup("RustDesk-Install.exe"));
+        assert!(is_setup("ANYTHING-INSTALL.EXE"));
+        assert!(!is_setup("rustdesk.exe"));
+        assert!(!is_setup("install.exe.bak"));
+        assert!(!is_setup("install"));
+        assert!(!is_setup(""));
+    }
+
+    // --- is_public URL checks ---
+
+    #[test]
+    fn test_is_public_edge_cases() {
+        // Empty string
+        assert!(!is_public(""));
+        // Just the domain, no protocol
+        assert!(is_public("rustdesk.com"));
+        // With trailing slash (matches "rustdesk.com/")
+        assert!(is_public("rustdesk.com/"));
+        // Subdomain
+        assert!(is_public("sub.rustdesk.com"));
+        // NOTE: is_public() uses ends_with("rustdesk.com") — no dot boundary check.
+        // This means "notrustdesk.com" and "evilrustdesk.com" both match.
+        // Documenting current behavior (potential concern — substring match, not domain match).
+        assert!(is_public("notrustdesk.com"));  // ends_with match
+        assert!(is_public("evilrustdesk.com")); // ends_with match
+        assert!(!is_public("rustdesk.com.evil.com")); // does NOT end with rustdesk.com
+    }
+
+    // --- pk_to_fingerprint ---
+
+    #[test]
+    fn test_pk_to_fingerprint_empty() {
+        assert_eq!(pk_to_fingerprint(vec![]), "");
+    }
+
+    #[test]
+    fn test_pk_to_fingerprint_single_byte() {
+        assert_eq!(pk_to_fingerprint(vec![0xab]), "ab");
+    }
+
+    #[test]
+    fn test_pk_to_fingerprint_formatting() {
+        // Each byte becomes 2 hex chars, space inserted every 4 chars
+        let pk = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let result = pk_to_fingerprint(pk);
+        // "0102030405" with spaces every 4 chars: "0102 0304 05"
+        assert_eq!(result, "0102 0304 05");
+    }
+
+    #[test]
+    fn test_pk_to_fingerprint_32_bytes() {
+        let pk: Vec<u8> = (0..32).collect();
+        let result = pk_to_fingerprint(pk);
+        // 32 bytes = 64 hex chars, spaces every 4 chars = 15 spaces
+        // Total length = 64 + 15 = 79
+        assert_eq!(result.len(), 79);
+        // Verify first group
+        assert!(result.starts_with("0001 0203"));
+        // No leading/trailing spaces
+        assert!(!result.starts_with(' '));
+        assert!(!result.ends_with(' '));
+    }
+
+    // --- get_pk ---
+
+    #[test]
+    fn test_get_pk() {
+        // Exactly 32 bytes: returns Some
+        let data = [42u8; 32];
+        assert_eq!(get_pk(&data), Some([42u8; 32]));
+
+        // Too short
+        assert_eq!(get_pk(&[1, 2, 3]), None);
+
+        // Too long
+        assert_eq!(get_pk(&[0u8; 33]), None);
+
+        // Empty
+        assert_eq!(get_pk(&[]), None);
+    }
+
+    // --- encode64 / decode64 round-trip ---
+
+    #[test]
+    fn test_encode64_decode64_roundtrip() {
+        let original = b"Hello, RustDesk!";
+        let encoded = encode64(original);
+        let decoded = decode64(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode64_empty() {
+        assert_eq!(encode64(b""), "");
+        assert_eq!(decode64("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_decode64_invalid() {
+        assert!(decode64("not valid base64!!!").is_err());
+    }
+
+    // --- str2color ---
+
+    #[test]
+    fn test_str2color_deterministic() {
+        // Same input always gives same output
+        let c1 = str2color("hello", 0xFF);
+        let c2 = str2color("hello", 0xFF);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_str2color_alpha_channel() {
+        let c = str2color("test", 0xFF);
+        // Alpha is in top byte
+        assert_eq!((c >> 24) & 0xFF, 0xFF);
+
+        let c_half = str2color("test", 0x80);
+        assert_eq!((c_half >> 24) & 0xFF, 0x80);
+
+        let c_zero = str2color("test", 0x00);
+        assert_eq!((c_zero >> 24) & 0xFF, 0x00);
+    }
+
+    #[test]
+    fn test_str2color_rgb_masked() {
+        // The function masks with 0xFF7FFF, so bit 15 of RGB is always 0
+        let c = str2color("any string", 0xFF);
+        let rgb = c & 0x00FFFFFF;
+        assert_eq!(
+            rgb & 0x008000,
+            0,
+            "Bit 15 of RGB should always be 0 due to mask"
+        );
+    }
+
+    #[test]
+    fn test_str2color_different_strings() {
+        // Different strings should (very likely) produce different colors
+        let c1 = str2color("alice", 0xFF);
+        let c2 = str2color("bob", 0xFF);
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_str2color_empty() {
+        // Empty string: hash stays 0, so color is just alpha
+        let c = str2color("", 0xFF);
+        assert_eq!(c, 0xFF000000);
+    }
+
+    // --- get_control_permission ---
+
+    #[test]
+    fn test_get_control_permission_not_set() {
+        use hbb_common::rendezvous_proto::control_permissions::Permission;
+        // All zeros = not set for any permission
+        assert_eq!(get_control_permission(0, Permission::keyboard), None);
+        assert_eq!(get_control_permission(0, Permission::clipboard), None);
+    }
+
+    #[test]
+    fn test_get_control_permission_disabled() {
+        use hbb_common::rendezvous_proto::control_permissions::Permission;
+        // Permission::keyboard = 0, so bits 0-1. Value 1 = disabled.
+        let permissions: u64 = 0b01; // bits 0-1 = 01 = disabled
+        assert_eq!(
+            get_control_permission(permissions, Permission::keyboard),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_get_control_permission_enabled() {
+        use hbb_common::rendezvous_proto::control_permissions::Permission;
+        // Value 2 = enabled for keyboard (index 0, bits 0-1)
+        let permissions: u64 = 0b10;
+        assert_eq!(
+            get_control_permission(permissions, Permission::keyboard),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_get_control_permission_invalid_value() {
+        use hbb_common::rendezvous_proto::control_permissions::Permission;
+        // Value 3 = invalid, treated as not set
+        let permissions: u64 = 0b11;
+        assert_eq!(
+            get_control_permission(permissions, Permission::keyboard),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_control_permission_multiple_permissions() {
+        use hbb_common::rendezvous_proto::control_permissions::Permission;
+        // keyboard = index 0 → shift 0, bits 0-1
+        // clipboard = index 2 → shift 4, bits 4-5
+        // keyboard = enabled (0b10), clipboard = disabled (0b01)
+        let permissions: u64 = (0b01 << 4) | (0b10 << 0); // clipboard=01 at bits 4-5, keyboard=10 at bits 0-1
+        assert_eq!(
+            get_control_permission(permissions, Permission::keyboard),
+            Some(true)
+        );
+        assert_eq!(
+            get_control_permission(permissions, Permission::clipboard),
+            Some(false)
+        );
+    }
+
+    // --- is_keyboard_mode_supported ---
+
+    #[test]
+    fn test_keyboard_mode_legacy_always_supported() {
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Legacy,
+            0,
+            "Windows"
+        ));
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Legacy,
+            0,
+            "Linux"
+        ));
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Legacy,
+            0,
+            "Android"
+        ));
+        assert!(is_keyboard_mode_supported(&KeyboardMode::Legacy, 0, ""));
+    }
+
+    #[test]
+    fn test_keyboard_mode_map_not_on_android() {
+        let ver = hbb_common::get_version_number("1.3.0");
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Map,
+            ver,
+            "Windows"
+        ));
+        assert!(is_keyboard_mode_supported(&KeyboardMode::Map, ver, "Linux"));
+        assert!(!is_keyboard_mode_supported(
+            &KeyboardMode::Map,
+            ver,
+            "Android"
+        ));
+    }
+
+    #[test]
+    fn test_keyboard_mode_map_version_check() {
+        // Requires >= 1.2.0
+        let old_ver = hbb_common::get_version_number("1.1.9");
+        let min_ver = hbb_common::get_version_number("1.2.0");
+        assert!(!is_keyboard_mode_supported(
+            &KeyboardMode::Map,
+            old_ver,
+            "Windows"
+        ));
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Map,
+            min_ver,
+            "Windows"
+        ));
+    }
+
+    #[test]
+    fn test_keyboard_mode_translate_version_check() {
+        let old_ver = hbb_common::get_version_number("1.1.9");
+        let min_ver = hbb_common::get_version_number("1.2.0");
+        // Translate doesn't have the Android restriction
+        assert!(!is_keyboard_mode_supported(
+            &KeyboardMode::Translate,
+            old_ver,
+            "Android"
+        ));
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Translate,
+            min_ver,
+            "Android"
+        ));
+    }
+
+    #[test]
+    fn test_keyboard_mode_auto_version_check() {
+        let old_ver = hbb_common::get_version_number("1.1.9");
+        let min_ver = hbb_common::get_version_number("1.2.0");
+        assert!(!is_keyboard_mode_supported(
+            &KeyboardMode::Auto,
+            old_ver,
+            "Linux"
+        ));
+        assert!(is_keyboard_mode_supported(
+            &KeyboardMode::Auto,
+            min_ver,
+            "Linux"
+        ));
+    }
+
+    #[test]
+    fn test_get_supported_keyboard_modes() {
+        // Very old version: only Legacy
+        let modes = get_supported_keyboard_modes(0, "Windows");
+        assert_eq!(modes, vec![KeyboardMode::Legacy]);
+
+        // New version on Windows: all modes
+        let ver = hbb_common::get_version_number("1.3.0");
+        let modes = get_supported_keyboard_modes(ver, "Windows");
+        assert!(modes.contains(&KeyboardMode::Legacy));
+        assert!(modes.contains(&KeyboardMode::Map));
+        assert!(modes.contains(&KeyboardMode::Translate));
+        assert!(modes.contains(&KeyboardMode::Auto));
+
+        // New version on Android: no Map
+        let modes = get_supported_keyboard_modes(ver, "Android");
+        assert!(modes.contains(&KeyboardMode::Legacy));
+        assert!(!modes.contains(&KeyboardMode::Map));
+        assert!(modes.contains(&KeyboardMode::Translate));
+        assert!(modes.contains(&KeyboardMode::Auto));
+    }
+
+    // --- valid_for_numlock ---
+
+    #[test]
+    fn test_valid_for_numlock_numpad_keys() {
+        for key in [
+            ControlKey::Numpad0,
+            ControlKey::Numpad1,
+            ControlKey::Numpad5,
+            ControlKey::Numpad9,
+            ControlKey::Decimal,
+        ] {
+            let mut evt = KeyEvent::new();
+            evt.union = Some(key_event::Union::ControlKey(key.into()));
+            assert!(
+                valid_for_numlock(&evt),
+                "Expected valid_for_numlock for {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_for_numlock_non_numpad_keys() {
+        for key in [
+            ControlKey::Alt,
+            ControlKey::Control,
+            ControlKey::Return,
+            ControlKey::Space,
+        ] {
+            let mut evt = KeyEvent::new();
+            evt.union = Some(key_event::Union::ControlKey(key.into()));
+            assert!(
+                !valid_for_numlock(&evt),
+                "Expected NOT valid_for_numlock for {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_for_numlock_non_control_key() {
+        // A character key event (not ControlKey) should return false
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::Chr(65)); // 'A'
+        assert!(!valid_for_numlock(&evt));
+    }
+
+    // --- is_control_key ---
+
+    #[test]
+    fn test_is_control_key_match() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::ControlKey(ControlKey::Return.into()));
+        assert!(is_control_key(&evt, &ControlKey::Return));
+        assert!(!is_control_key(&evt, &ControlKey::Space));
+    }
+
+    #[test]
+    fn test_is_control_key_non_control() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::Chr(13));
+        assert!(!is_control_key(&evt, &ControlKey::Return));
+    }
+
+    // --- is_modifier ---
+
+    #[test]
+    fn test_is_modifier_positive() {
+        for key in [
+            ControlKey::Alt,
+            ControlKey::Shift,
+            ControlKey::Control,
+            ControlKey::Meta,
+            ControlKey::RAlt,
+            ControlKey::RShift,
+            ControlKey::RControl,
+            ControlKey::RWin,
+        ] {
+            let mut evt = KeyEvent::new();
+            evt.union = Some(key_event::Union::ControlKey(key.into()));
+            assert!(is_modifier(&evt), "Expected is_modifier for {:?}", key);
+        }
+    }
+
+    #[test]
+    fn test_is_modifier_negative() {
+        for key in [
+            ControlKey::Return,
+            ControlKey::Space,
+            ControlKey::Tab,
+            ControlKey::Numpad0,
+        ] {
+            let mut evt = KeyEvent::new();
+            evt.union = Some(key_event::Union::ControlKey(key.into()));
+            assert!(!is_modifier(&evt), "Expected NOT is_modifier for {:?}", key);
+        }
+    }
+
+    #[test]
+    fn test_is_modifier_non_control_key() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::Chr(65));
+        assert!(!is_modifier(&evt));
+    }
+
+    // --- make_fd_to_json ---
+
+    #[test]
+    fn test_make_fd_to_json_empty_entries() {
+        let result = make_fd_to_json(1, "/home".to_string(), &vec![]);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["path"], "/home");
+        assert_eq!(parsed["entries"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_make_fd_to_json_with_entries() {
+        let mut entry = FileEntry::new();
+        entry.name = "test.txt".to_string();
+        entry.size = 1024;
+        entry.modified_time = 1700000000;
+        let result = make_fd_to_json(42, "/tmp".to_string(), &vec![entry]);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["path"], "/tmp");
+        let entries = parsed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "test.txt");
+        assert_eq!(entries[0]["size"], 1024);
+        assert_eq!(entries[0]["modified_time"], 1700000000);
+    }
+
+    // --- make_vec_fd_to_json ---
+
+    #[test]
+    fn test_make_vec_fd_to_json_empty() {
+        let result = make_vec_fd_to_json(&[]);
+        assert_eq!(result, "[]");
+    }
+
+    // --- Duration math (additional edge cases) ---
+
+    #[test]
+    fn test_duration_zero_multiplication() {
+        let dur = Duration::from_secs(0);
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 1.5),
+            Duration::from_secs(0)
+        );
+    }
+
+    #[test]
+    fn test_duration_large_values() {
+        let dur = Duration::from_secs(3600);
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.5),
+            Duration::from_secs(1800)
+        );
     }
 }

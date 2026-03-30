@@ -52,7 +52,7 @@ use serde_json::{json, value::Value};
 use std::sync::atomic::Ordering;
 use std::{
     collections::HashSet,
-    net::Ipv6Addr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroI64,
     path::PathBuf,
     str::FromStr,
@@ -88,6 +88,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         x |= a[i] ^ b[i];
     }
     x == 0
+}
+
+/// Validate that a file path from a remote peer does not contain path traversal
+/// components ("..") or null bytes. This mitigates CWE-22 (Path Traversal).
+///
+/// RustDesk legitimately uses absolute paths for file operations, so absolute
+/// paths are allowed. Only ".." components and null bytes are rejected.
+fn is_safe_path(path: &str) -> bool {
+    // Reject null bytes which could truncate paths at the OS level
+    if path.contains('\0') {
+        return false;
+    }
+    // Reject paths containing ".." components (works for both / and \ separators)
+    let p = std::path::Path::new(path);
+    for component in p.components() {
+        if let std::path::Component::ParentDir = component {
+            return false;
+        }
+    }
+    // Also catch encoded or non-normalized ".." that Path::components might miss
+    // (e.g. on Linux where "\.." is not parsed as ParentDir)
+    if path.contains("..") {
+        return false;
+    }
+    true
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1353,6 +1378,94 @@ impl Connection {
         crate::post_request(url, v.to_string(), "").await
     }
 
+    /// Check whether a port-forward target host is allowed.
+    ///
+    /// By default only localhost and private-network addresses are permitted.
+    /// This prevents an authenticated remote peer from using the machine as an
+    /// open proxy to reach cloud metadata endpoints, link-local services, or
+    /// arbitrary Internet hosts (CWE-918 / SSRF).
+    ///
+    /// Setting the config option `allow-remote-port-forward` to `"Y"` bypasses
+    /// all restrictions (for advanced users who intentionally expose this).
+    fn is_port_forward_target_allowed(host: &str) -> bool {
+        // If the admin explicitly opted in, allow everything.
+        if Config::get_option("allow-remote-port-forward") == "Y" {
+            return true;
+        }
+
+        // Empty host will be replaced with "localhost" by the caller — always OK.
+        if host.is_empty() {
+            return true;
+        }
+
+        let host_lower = host.to_lowercase();
+
+        // The special "RDP" token is normalized later to localhost:3389.
+        if host_lower == "rdp" {
+            return true;
+        }
+
+        // Localhost names are always fine.
+        if host_lower == "localhost" {
+            return true;
+        }
+
+        // Block well-known cloud metadata hostnames.
+        const BLOCKED_HOSTNAMES: &[&str] = &[
+            "metadata.google.internal",
+            "metadata.google.internal.",
+        ];
+        if BLOCKED_HOSTNAMES.contains(&host_lower.as_str()) {
+            return false;
+        }
+
+        // Try to parse as IP address.
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return match ip {
+                IpAddr::V4(v4) => {
+                    if v4.is_loopback() {
+                        // 127.0.0.0/8
+                        return true;
+                    }
+                    // Block unspecified (0.0.0.0).
+                    if v4.is_unspecified() {
+                        return false;
+                    }
+                    // Block link-local 169.254.0.0/16 (includes cloud metadata 169.254.169.254).
+                    if v4.is_link_local() {
+                        return false;
+                    }
+                    // Allow private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16.
+                    if v4.is_private() {
+                        return true;
+                    }
+                    // Block cloud metadata alias used by some providers.
+                    if v4 == Ipv4Addr::new(100, 100, 100, 200) {
+                        return false;
+                    }
+                    // Everything else (public IPs) is blocked by default.
+                    false
+                }
+                IpAddr::V6(v6) => {
+                    if v6.is_loopback() {
+                        // ::1
+                        return true;
+                    }
+                    // Block unspecified (::).
+                    if v6.is_unspecified() {
+                        return false;
+                    }
+                    // For other IPv6 addresses, block by default.
+                    false
+                }
+            };
+        }
+
+        // Non-IP hostnames that are not localhost and not a blocked metadata
+        // name: block by default (could resolve to anything).
+        false
+    }
+
     fn normalize_port_forward_target(pf: &mut PortForward) -> (String, bool) {
         let mut is_rdp = false;
         if pf.host == "RDP" && pf.port == 0 {
@@ -1374,6 +1487,22 @@ impl Connection {
             return true;
         };
         let mut pf = pf.clone();
+        // Validate the target BEFORE normalization so we check the raw host
+        // the peer actually requested (normalization turns "" → "localhost"
+        // and "RDP" → "localhost", both of which are safe).
+        if !Self::is_port_forward_target_allowed(&pf.host) {
+            log::warn!(
+                "Port forward target rejected (SSRF prevention): host={:?} port={}",
+                pf.host,
+                pf.port
+            );
+            self.send_login_error(format!(
+                "Port forward to '{}' is not allowed. Only localhost and private network addresses are permitted.",
+                pf.host
+            ))
+            .await;
+            return false;
+        }
         let (mut addr, is_rdp) = Self::normalize_port_forward_target(&mut pf);
         self.port_forward_address = addr.clone();
         match timeout(3000, TcpStream::connect(&addr)).await {
@@ -2309,6 +2438,20 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
+                    if !Self::is_port_forward_target_allowed(&pf.host) {
+                        log::warn!(
+                            "Port forward target rejected during login (SSRF prevention): host={:?} port={}",
+                            pf.host,
+                            pf.port
+                        );
+                        self.send_login_error(format!(
+                            "Port forward to '{}' is not allowed. Only localhost and private network addresses are permitted.",
+                            pf.host
+                        ))
+                        .await;
+                        sleep(1.).await;
+                        return false;
+                    }
                     let (addr, _is_rdp) = Self::normalize_port_forward_target(&mut pf);
                     self.port_forward_address = addr;
                 }
@@ -2860,6 +3003,59 @@ impl Connection {
                                 self.send(fs::new_error(job_id, "one-way-file-transfer-tip", 0))
                                     .await;
                                 return true;
+                            }
+                        }
+                        // Path traversal protection (CWE-22): validate all
+                        // client-supplied paths before any file operation.
+                        {
+                            let mut paths_to_check: Vec<(&str, Option<i32>)> = Vec::new();
+                            match &fa.union {
+                                Some(file_action::Union::ReadEmptyDirs(rd)) => {
+                                    paths_to_check.push((&rd.path, None));
+                                }
+                                Some(file_action::Union::ReadDir(rd)) => {
+                                    paths_to_check.push((&rd.path, None));
+                                }
+                                Some(file_action::Union::AllFiles(f)) => {
+                                    paths_to_check.push((&f.path, Some(f.id)));
+                                }
+                                Some(file_action::Union::Send(s)) => {
+                                    paths_to_check.push((&s.path, Some(s.id)));
+                                }
+                                Some(file_action::Union::Receive(r)) => {
+                                    paths_to_check.push((&r.path, Some(r.id)));
+                                }
+                                Some(file_action::Union::RemoveDir(d)) => {
+                                    paths_to_check.push((&d.path, Some(d.id)));
+                                }
+                                Some(file_action::Union::RemoveFile(f)) => {
+                                    paths_to_check.push((&f.path, Some(f.id)));
+                                }
+                                Some(file_action::Union::Create(c)) => {
+                                    paths_to_check.push((&c.path, Some(c.id)));
+                                }
+                                Some(file_action::Union::Rename(r)) => {
+                                    paths_to_check.push((&r.path, Some(r.id)));
+                                    paths_to_check.push((&r.new_name, Some(r.id)));
+                                }
+                                _ => {}
+                            }
+                            for (path, id) in &paths_to_check {
+                                if !is_safe_path(path) {
+                                    log::warn!(
+                                        "Path traversal attempt blocked: {:?} from peer",
+                                        path
+                                    );
+                                    if let Some(id) = id {
+                                        self.send(fs::new_error(
+                                            *id,
+                                            "Unsafe path rejected".to_string(),
+                                            0,
+                                        ))
+                                        .await;
+                                    }
+                                    return true;
+                                }
                             }
                         }
                         match fa.union {
@@ -5629,6 +5825,7 @@ mod raii {
 mod test {
     #[allow(unused)]
     use super::*;
+    use hbb_common::rand;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -5667,5 +5864,777 @@ mod test {
         assert!(Ipv6Addr::from_str("::1").is_ok());
         assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
         assert!(Ipv6Addr::from_str("0").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // constant_time_eq
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn constant_time_eq_equal_slices() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+    }
+
+    #[test]
+    fn constant_time_eq_different_slices() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hellp"));
+        // Differ only in the last byte.
+        assert!(!constant_time_eq(b"\x00\x00\x01", b"\x00\x00\x02"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn constant_time_eq_single_bit_difference() {
+        // Slices that differ by exactly one bit in one byte.
+        let a = [0b1010_1010u8];
+        let b = [0b1010_1011u8];
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    // ---------------------------------------------------------------
+    // normalize_port_forward_target
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn normalize_port_forward_rdp_defaults() {
+        let mut pf = PortForward {
+            host: "RDP".to_owned(),
+            port: 0,
+            ..Default::default()
+        };
+        let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
+        assert_eq!(addr, "localhost:3389");
+        assert!(is_rdp);
+        assert_eq!(pf.host, "localhost");
+        assert_eq!(pf.port, 3389);
+    }
+
+    #[test]
+    fn normalize_port_forward_rdp_host_with_nonzero_port_not_rdp() {
+        // "RDP" host but port != 0 — should NOT trigger RDP normalization.
+        let mut pf = PortForward {
+            host: "RDP".to_owned(),
+            port: 5900,
+            ..Default::default()
+        };
+        let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
+        assert_eq!(addr, "RDP:5900");
+        assert!(!is_rdp);
+    }
+
+    #[test]
+    fn normalize_port_forward_empty_host() {
+        let mut pf = PortForward {
+            host: "".to_owned(),
+            port: 8080,
+            ..Default::default()
+        };
+        let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
+        assert_eq!(addr, "localhost:8080");
+        assert!(!is_rdp);
+        assert_eq!(pf.host, "localhost");
+    }
+
+    #[test]
+    fn normalize_port_forward_custom_host_and_port() {
+        let mut pf = PortForward {
+            host: "192.168.1.100".to_owned(),
+            port: 22,
+            ..Default::default()
+        };
+        let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
+        assert_eq!(addr, "192.168.1.100:22");
+        assert!(!is_rdp);
+        // host should be unchanged
+        assert_eq!(pf.host, "192.168.1.100");
+    }
+
+    #[test]
+    fn normalize_port_forward_zero_port_non_rdp_host() {
+        let mut pf = PortForward {
+            host: "myserver".to_owned(),
+            port: 0,
+            ..Default::default()
+        };
+        let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
+        assert_eq!(addr, "myserver:0");
+        assert!(!is_rdp);
+    }
+
+    // ---------------------------------------------------------------
+    // is_port_forward_target_allowed
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn port_forward_allows_localhost() {
+        assert!(Connection::is_port_forward_target_allowed("localhost"));
+    }
+
+    #[test]
+    fn port_forward_allows_localhost_uppercase() {
+        assert!(Connection::is_port_forward_target_allowed("LOCALHOST"));
+    }
+
+    #[test]
+    fn port_forward_allows_127_0_0_1() {
+        assert!(Connection::is_port_forward_target_allowed("127.0.0.1"));
+    }
+
+    #[test]
+    fn port_forward_allows_ipv6_loopback() {
+        assert!(Connection::is_port_forward_target_allowed("::1"));
+    }
+
+    #[test]
+    fn port_forward_allows_empty_host() {
+        // Empty host is normalized to "localhost" by the caller.
+        assert!(Connection::is_port_forward_target_allowed(""));
+    }
+
+    #[test]
+    fn port_forward_allows_rdp_keyword() {
+        assert!(Connection::is_port_forward_target_allowed("RDP"));
+        assert!(Connection::is_port_forward_target_allowed("rdp"));
+    }
+
+    #[test]
+    fn port_forward_allows_private_10_x() {
+        assert!(Connection::is_port_forward_target_allowed("10.0.0.1"));
+        assert!(Connection::is_port_forward_target_allowed("10.255.255.255"));
+    }
+
+    #[test]
+    fn port_forward_allows_private_172_16_x() {
+        assert!(Connection::is_port_forward_target_allowed("172.16.0.1"));
+        assert!(Connection::is_port_forward_target_allowed("172.31.255.255"));
+    }
+
+    #[test]
+    fn port_forward_allows_private_192_168_x() {
+        assert!(Connection::is_port_forward_target_allowed("192.168.1.100"));
+        assert!(Connection::is_port_forward_target_allowed("192.168.0.1"));
+    }
+
+    #[test]
+    fn port_forward_blocks_cloud_metadata_169_254_169_254() {
+        assert!(!Connection::is_port_forward_target_allowed("169.254.169.254"));
+    }
+
+    #[test]
+    fn port_forward_blocks_link_local() {
+        assert!(!Connection::is_port_forward_target_allowed("169.254.0.1"));
+        assert!(!Connection::is_port_forward_target_allowed("169.254.255.255"));
+    }
+
+    #[test]
+    fn port_forward_blocks_unspecified_ipv4() {
+        assert!(!Connection::is_port_forward_target_allowed("0.0.0.0"));
+    }
+
+    #[test]
+    fn port_forward_blocks_unspecified_ipv6() {
+        assert!(!Connection::is_port_forward_target_allowed("::"));
+    }
+
+    #[test]
+    fn port_forward_blocks_public_ip() {
+        assert!(!Connection::is_port_forward_target_allowed("8.8.8.8"));
+        assert!(!Connection::is_port_forward_target_allowed("1.1.1.1"));
+        assert!(!Connection::is_port_forward_target_allowed("203.0.113.1"));
+    }
+
+    #[test]
+    fn port_forward_blocks_metadata_google_internal() {
+        assert!(!Connection::is_port_forward_target_allowed("metadata.google.internal"));
+        assert!(!Connection::is_port_forward_target_allowed("METADATA.GOOGLE.INTERNAL"));
+    }
+
+    #[test]
+    fn port_forward_blocks_alibaba_cloud_metadata() {
+        assert!(!Connection::is_port_forward_target_allowed("100.100.100.200"));
+    }
+
+    #[test]
+    fn port_forward_blocks_arbitrary_hostname() {
+        // Non-IP hostnames could resolve to anything — block by default.
+        assert!(!Connection::is_port_forward_target_allowed("evil.example.com"));
+        assert!(!Connection::is_port_forward_target_allowed("myserver"));
+    }
+
+    #[test]
+    fn port_forward_blocks_172_outside_private_range() {
+        // 172.32.0.0 is NOT in 172.16.0.0/12.
+        assert!(!Connection::is_port_forward_target_allowed("172.32.0.1"));
+    }
+
+    #[test]
+    fn port_forward_allows_127_x_loopback_range() {
+        // The entire 127.0.0.0/8 is loopback.
+        assert!(Connection::is_port_forward_target_allowed("127.0.0.2"));
+        assert!(Connection::is_port_forward_target_allowed("127.255.255.255"));
+    }
+
+    // ---------------------------------------------------------------
+    // SessionKey Hash / Eq
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn session_key_equality() {
+        let k1 = SessionKey {
+            peer_id: "peer1".into(),
+            name: "Alice".into(),
+            session_id: 42,
+        };
+        let k2 = SessionKey {
+            peer_id: "peer1".into(),
+            name: "Alice".into(),
+            session_id: 42,
+        };
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_inequality_peer_id() {
+        let k1 = SessionKey {
+            peer_id: "peer1".into(),
+            name: "Alice".into(),
+            session_id: 42,
+        };
+        let k2 = SessionKey {
+            peer_id: "peer2".into(),
+            name: "Alice".into(),
+            session_id: 42,
+        };
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_inequality_session_id() {
+        let k1 = SessionKey {
+            peer_id: "peer1".into(),
+            name: "Alice".into(),
+            session_id: 1,
+        };
+        let k2 = SessionKey {
+            peer_id: "peer1".into(),
+            name: "Alice".into(),
+            session_id: 2,
+        };
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_key_usable_as_hashmap_key() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let k = SessionKey {
+            peer_id: "p".into(),
+            name: "n".into(),
+            session_id: 99,
+        };
+        map.insert(k.clone(), "value");
+        assert_eq!(map.get(&k), Some(&"value"));
+    }
+
+    // ---------------------------------------------------------------
+    // SESSIONS — update_or_insert_session and session expiry
+    // ---------------------------------------------------------------
+
+    /// Helper: create a unique SessionKey so parallel tests don't collide.
+    fn unique_session_key(tag: &str) -> SessionKey {
+        SessionKey {
+            peer_id: format!("test-peer-{}-{}", tag, std::thread::current().name().unwrap_or("?")),
+            name: format!("test-name-{}", tag),
+            session_id: rand::random::<u64>(),
+        }
+    }
+
+    #[test]
+    fn session_insert_and_lookup() {
+        let key = unique_session_key("insert");
+        raii::AuthedConnID::update_or_insert_session(key.clone(), Some("pwd123".into()), Some(false));
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).expect("session should exist");
+        assert_eq!(session.random_password, "pwd123");
+        assert!(!session.tfa);
+        drop(sessions);
+
+        // Cleanup
+        SESSIONS.lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn session_update_password() {
+        let key = unique_session_key("update-pwd");
+        raii::AuthedConnID::update_or_insert_session(key.clone(), Some("old".into()), Some(false));
+        raii::AuthedConnID::update_or_insert_session(key.clone(), Some("new".into()), None);
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).unwrap();
+        assert_eq!(session.random_password, "new");
+        assert!(!session.tfa, "tfa should remain unchanged when None passed");
+        drop(sessions);
+
+        SESSIONS.lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn session_update_tfa_only() {
+        let key = unique_session_key("update-tfa");
+        raii::AuthedConnID::update_or_insert_session(key.clone(), Some("pwd".into()), Some(false));
+        raii::AuthedConnID::update_or_insert_session(key.clone(), None, Some(true));
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).unwrap();
+        assert_eq!(session.random_password, "pwd", "password should remain unchanged");
+        assert!(session.tfa);
+        drop(sessions);
+
+        SESSIONS.lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn session_insert_defaults_when_none() {
+        let key = unique_session_key("defaults");
+        raii::AuthedConnID::update_or_insert_session(key.clone(), None, None);
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).unwrap();
+        assert_eq!(session.random_password, "");
+        assert!(!session.tfa);
+        drop(sessions);
+
+        SESSIONS.lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn session_set_2fa() {
+        let key = unique_session_key("set-2fa");
+        // set_session_2fa should create the session if it doesn't exist
+        raii::AuthedConnID::set_session_2fa(key.clone());
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).unwrap();
+        assert!(session.tfa);
+        assert_eq!(session.random_password, "");
+        drop(sessions);
+
+        // Calling again on existing session should update tfa
+        raii::AuthedConnID::update_or_insert_session(key.clone(), Some("pw".into()), Some(false));
+        raii::AuthedConnID::set_session_2fa(key.clone());
+
+        let sessions = SESSIONS.lock().unwrap();
+        let session = sessions.get(&key).unwrap();
+        assert!(session.tfa);
+        assert_eq!(session.random_password, "pw");
+        drop(sessions);
+
+        SESSIONS.lock().unwrap().remove(&key);
+    }
+
+    // ---------------------------------------------------------------
+    // LOGIN_FAILURES — bump logic
+    // ---------------------------------------------------------------
+    //
+    // The `bump` function is nested inside `update_failure` and not directly
+    // accessible. We replicate its logic here to validate the rate-limiting
+    // arithmetic independently.
+
+    /// Replicate the bump logic from update_failure to test it in isolation.
+    fn bump(mut cur: (i32, i32, i32), time: i32) -> (i32, i32, i32) {
+        if cur.0 == time {
+            cur.1 += 1;
+            cur.2 += 1;
+        } else {
+            cur.0 = time;
+            cur.1 = 1;
+            cur.2 += 1;
+        }
+        cur
+    }
+
+    #[test]
+    fn bump_first_failure() {
+        let result = bump((0, 0, 0), 100);
+        // New time window, so minute-count resets to 1, total becomes 1.
+        assert_eq!(result, (100, 1, 1));
+    }
+
+    #[test]
+    fn bump_same_minute() {
+        let cur = (100, 3, 10);
+        let result = bump(cur, 100);
+        // Same minute: minute-count increments, total increments.
+        assert_eq!(result, (100, 4, 11));
+    }
+
+    #[test]
+    fn bump_new_minute_resets_per_minute_counter() {
+        let cur = (100, 5, 20);
+        let result = bump(cur, 101);
+        // Different minute: minute-count resets to 1, total still increments.
+        assert_eq!(result, (101, 1, 21));
+    }
+
+    #[test]
+    fn bump_reaches_per_minute_threshold() {
+        // Simulate 6 failures in the same minute (the per-minute threshold is >6).
+        let mut cur = (0, 0, 0);
+        for _ in 0..7 {
+            cur = bump(cur, 50);
+        }
+        assert_eq!(cur.0, 50);
+        assert_eq!(cur.1, 7); // 7 > 6 triggers "try 1 minute later"
+        assert_eq!(cur.2, 7);
+    }
+
+    #[test]
+    fn bump_reaches_total_threshold() {
+        // Simulate 31 failures across different minutes (total threshold is >30).
+        let mut cur = (0, 0, 0);
+        for minute in 0..31 {
+            cur = bump(cur, minute);
+        }
+        assert_eq!(cur.2, 31); // 31 > 30 triggers "too many wrong attempts"
+        assert_eq!(cur.1, 1); // Each minute only had 1 attempt
+    }
+
+    #[test]
+    fn bump_per_minute_resets_across_minutes() {
+        // 5 failures in minute 10, then 5 in minute 11: never exceeds 6 per minute.
+        let mut cur = (0, 0, 0);
+        for _ in 0..5 {
+            cur = bump(cur, 10);
+        }
+        assert_eq!(cur, (10, 5, 5));
+        for _ in 0..5 {
+            cur = bump(cur, 11);
+        }
+        assert_eq!(cur, (11, 5, 10));
+        // Neither per-minute (5 <= 6) nor total (10 <= 30) thresholds exceeded.
+    }
+
+    // ---------------------------------------------------------------
+    // LOGIN_FAILURES — direct static manipulation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn login_failures_static_insert_and_read() {
+        // Use a unique IP to avoid interference from other tests.
+        let ip = format!("test-lf-{}", rand::random::<u64>());
+        let map = &LOGIN_FAILURES[0];
+
+        // Initially empty for this IP.
+        assert!(map.lock().unwrap().get(&ip).is_none());
+
+        // Insert a failure record.
+        map.lock().unwrap().insert(ip.clone(), (100, 3, 15));
+        let val = map.lock().unwrap().get(&ip).copied();
+        assert_eq!(val, Some((100, 3, 15)));
+
+        // Cleanup.
+        map.lock().unwrap().remove(&ip);
+    }
+
+    #[test]
+    fn login_failures_two_maps_are_independent() {
+        let ip = format!("test-lf-indep-{}", rand::random::<u64>());
+        LOGIN_FAILURES[0].lock().unwrap().insert(ip.clone(), (1, 1, 1));
+
+        // The second map should not have this entry.
+        assert!(LOGIN_FAILURES[1].lock().unwrap().get(&ip).is_none());
+
+        // Cleanup.
+        LOGIN_FAILURES[0].lock().unwrap().remove(&ip);
+    }
+
+    // ---------------------------------------------------------------
+    // IPv6 prefix masking (replicated from get_ipv6_prefixes)
+    // ---------------------------------------------------------------
+
+    /// Replicate the mask_u128 helper from get_ipv6_prefixes.
+    fn mask_u128(addr: u128, prefix: u8) -> u128 {
+        let mask = if prefix == 0 || prefix > 128 {
+            0
+        } else {
+            (!0u128) << (128 - prefix)
+        };
+        addr & mask
+    }
+
+    #[test]
+    fn mask_u128_slash_64() {
+        // 2001:db8:abcd:1234:5678:9abc:def0:1234
+        let addr: u128 = 0x2001_0db8_abcd_1234_5678_9abc_def0_1234;
+        let masked = mask_u128(addr, 64);
+        assert_eq!(masked, 0x2001_0db8_abcd_1234_0000_0000_0000_0000);
+    }
+
+    #[test]
+    fn mask_u128_slash_56() {
+        let addr: u128 = 0x2001_0db8_abcd_1234_5678_9abc_def0_1234;
+        let masked = mask_u128(addr, 56);
+        assert_eq!(masked, 0x2001_0db8_abcd_1200_0000_0000_0000_0000);
+    }
+
+    #[test]
+    fn mask_u128_slash_48() {
+        let addr: u128 = 0x2001_0db8_abcd_1234_5678_9abc_def0_1234;
+        let masked = mask_u128(addr, 48);
+        assert_eq!(masked, 0x2001_0db8_abcd_0000_0000_0000_0000_0000);
+    }
+
+    #[test]
+    fn mask_u128_slash_128_is_identity() {
+        let addr: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+        assert_eq!(mask_u128(addr, 128), addr);
+    }
+
+    #[test]
+    fn mask_u128_slash_0_is_zero() {
+        let addr: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+        assert_eq!(mask_u128(addr, 0), 0);
+    }
+
+    #[test]
+    fn mask_u128_slash_above_128_is_zero() {
+        let addr: u128 = 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+        assert_eq!(mask_u128(addr, 129), 0);
+        assert_eq!(mask_u128(addr, 255), 0);
+    }
+
+    #[test]
+    fn ipv6_prefix_strings_from_full_address() {
+        // End-to-end test: parse an IPv6 address and compute prefix strings
+        // the same way get_ipv6_prefixes does.
+        let ip_str = "2001:db8:abcd:1234:5678:9abc:def0:1234";
+        let ip = Ipv6Addr::from_str(ip_str).unwrap();
+        let as_u128 = u128::from_be_bytes(ip.octets());
+
+        let p64 = Ipv6Addr::from(mask_u128(as_u128, 64).to_be_bytes()).to_string() + "/64";
+        let p56 = Ipv6Addr::from(mask_u128(as_u128, 56).to_be_bytes()).to_string() + "/56";
+        let p48 = Ipv6Addr::from(mask_u128(as_u128, 48).to_be_bytes()).to_string() + "/48";
+
+        assert_eq!(p64, "2001:db8:abcd:1234::/64");
+        assert_eq!(p56, "2001:db8:abcd:1200::/56");
+        assert_eq!(p48, "2001:db8:abcd::/48");
+    }
+
+    #[test]
+    fn ipv6_prefix_loopback() {
+        let ip = Ipv6Addr::from_str("::1").unwrap();
+        let as_u128 = u128::from_be_bytes(ip.octets());
+
+        let p64 = Ipv6Addr::from(mask_u128(as_u128, 64).to_be_bytes()).to_string() + "/64";
+        let p48 = Ipv6Addr::from(mask_u128(as_u128, 48).to_be_bytes()).to_string() + "/48";
+
+        // ::1 with /64 mask zeroes out the host part entirely.
+        assert_eq!(p64, "::/64");
+        assert_eq!(p48, "::/48");
+    }
+
+    #[test]
+    fn ipv4_does_not_parse_as_ipv6() {
+        // get_ipv6_prefixes returns None for IPv4 addresses.
+        assert!(Ipv6Addr::from_str("192.168.1.1").is_err());
+    }
+
+    #[test]
+    fn ipv6_zone_id_stripping() {
+        // get_ipv6_prefixes strips zone IDs like "fe80::1%eth0".
+        let ip_with_zone = "fe80::1%eth0";
+        let ip_only = ip_with_zone.split('%').next().unwrap_or(ip_with_zone).trim();
+        assert_eq!(ip_only, "fe80::1");
+        assert!(Ipv6Addr::from_str(ip_only).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // ALIVE_CONNS via raii::ConnectionID
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn connection_id_registers_and_unregisters() {
+        // Use a distinctive conn_id unlikely to collide.
+        let conn_id = 900_000 + (rand::random::<i32>() & 0xFFFF);
+        {
+            let _raii = raii::ConnectionID::new(conn_id);
+            assert!(
+                ALIVE_CONNS.lock().unwrap().contains(&conn_id),
+                "conn_id should be in ALIVE_CONNS while ConnectionID is alive"
+            );
+        }
+        // After drop, it should be removed.
+        assert!(
+            !ALIVE_CONNS.lock().unwrap().contains(&conn_id),
+            "conn_id should be removed from ALIVE_CONNS after drop"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // ConnInner construction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn conn_inner_new() {
+        let inner = ConnInner::new(42, None, None);
+        assert_eq!(inner.id(), 42);
+    }
+
+    // ---------------------------------------------------------------
+    // AuthConnType equality
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn auth_conn_type_equality() {
+        assert_eq!(AuthConnType::Remote, AuthConnType::Remote);
+        assert_ne!(AuthConnType::Remote, AuthConnType::FileTransfer);
+        assert_ne!(AuthConnType::PortForward, AuthConnType::ViewCamera);
+        assert_eq!(AuthConnType::Terminal, AuthConnType::Terminal);
+    }
+
+    // ---------------------------------------------------------------
+    // SESSION_TIMEOUT constant
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn session_timeout_is_30_seconds() {
+        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    // ---------------------------------------------------------------
+    // Session expiry via SESSIONS retain logic
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn session_expiry_retain_removes_old_sessions() {
+        let key_fresh = unique_session_key("fresh");
+        let key_stale = unique_session_key("stale");
+
+        // Insert a fresh session.
+        raii::AuthedConnID::update_or_insert_session(key_fresh.clone(), Some("pw1".into()), Some(false));
+
+        // Insert a stale session by manually backdating its last_recv_time.
+        {
+            let mut lock = SESSIONS.lock().unwrap();
+            lock.insert(
+                key_stale.clone(),
+                Session {
+                    random_password: "pw2".into(),
+                    tfa: false,
+                    last_recv_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
+                },
+            );
+        }
+
+        // Trigger the retain logic (same as is_recent_session).
+        SESSIONS
+            .lock()
+            .unwrap()
+            .retain(|_, s| s.last_recv_time.lock().unwrap().elapsed() < SESSION_TIMEOUT);
+
+        let lock = SESSIONS.lock().unwrap();
+        assert!(lock.contains_key(&key_fresh), "fresh session should survive retain");
+        assert!(!lock.contains_key(&key_stale), "stale session should be pruned");
+        drop(lock);
+
+        // Cleanup.
+        SESSIONS.lock().unwrap().remove(&key_fresh);
+    }
+
+    // ---------------------------------------------------------------
+    // ControlPermissionsID RAII behavior
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn control_permissions_id_none_does_not_register() {
+        let conn_id = 800_000 + (rand::random::<i32>() & 0xFFFF);
+        {
+            let _raii = raii::ControlPermissionsID::new(conn_id, &None);
+            let lock = CONTROL_PERMISSIONS_ARRAY.lock().unwrap();
+            assert!(
+                !lock.iter().any(|(id, _)| *id == conn_id),
+                "None control_permissions should not be registered"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Path traversal validation (CWE-22)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn is_safe_path_allows_normal_absolute_paths() {
+        assert!(is_safe_path("/home/user/documents"));
+        assert!(is_safe_path("/tmp/file.txt"));
+        assert!(is_safe_path("C:\\Users\\user\\Desktop"));
+    }
+
+    #[test]
+    fn is_safe_path_allows_normal_relative_paths() {
+        assert!(is_safe_path("documents/file.txt"));
+        assert!(is_safe_path("file.txt"));
+        assert!(is_safe_path("./file.txt"));
+    }
+
+    #[test]
+    fn is_safe_path_allows_paths_with_spaces() {
+        assert!(is_safe_path("/home/user/my documents/file.txt"));
+        assert!(is_safe_path("C:\\Users\\user\\My Documents\\file.txt"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_dotdot_unix() {
+        assert!(!is_safe_path("../etc/passwd"));
+        assert!(!is_safe_path("/home/user/../../../etc/shadow"));
+        assert!(!is_safe_path("foo/../bar"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_dotdot_windows() {
+        assert!(!is_safe_path("..\\Windows\\System32"));
+        assert!(!is_safe_path("C:\\Users\\..\\Administrator"));
+        assert!(!is_safe_path("foo\\..\\bar"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_complex_traversal() {
+        assert!(!is_safe_path("foo/../../etc/passwd"));
+        assert!(!is_safe_path("a/b/c/../../../d/../../etc/passwd"));
+        assert!(!is_safe_path("/home/user/./../../etc/shadow"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_null_bytes() {
+        assert!(!is_safe_path("/home/user/file\0.txt"));
+        assert!(!is_safe_path("file\0"));
+        assert!(!is_safe_path("\0"));
+    }
+
+    #[test]
+    fn is_safe_path_handles_empty_path() {
+        // Empty path has no traversal and no null bytes
+        assert!(is_safe_path(""));
+    }
+
+    #[test]
+    fn is_safe_path_allows_unicode_paths() {
+        assert!(is_safe_path("/home/user/документы/файл.txt"));
+        assert!(is_safe_path("/home/user/文档/文件.txt"));
+        assert!(is_safe_path("/home/user/ドキュメント/ファイル.txt"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_dotdot_with_unicode() {
+        assert!(!is_safe_path("/home/user/документы/../etc/passwd"));
     }
 }

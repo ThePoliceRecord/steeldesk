@@ -92,6 +92,10 @@ impl SharedMemory {
             }
         };
         log::info!("Create shared memory, size: {}, flink: {}", size, flink);
+        // SECURITY(CWE-732): "F" grants full access (Everyone:Full on Windows).
+        // This is needed for cross-session communication in portable mode where
+        // the service and UI may run under different user accounts/sessions.
+        // Do not change without understanding the Windows portable IPC model.
         set_path_permission(Path::new(&flink), "F").ok();
         Ok(SharedMemory { inner: shmem })
     }
@@ -122,6 +126,9 @@ impl SharedMemory {
         dir = dir.join(hbb_common::config::APP_NAME.read().unwrap().clone());
         if !dir.exists() {
             std::fs::create_dir(&dir)?;
+            // SECURITY(CWE-732): "F" grants full access (Everyone:Full on Windows).
+            // Required for cross-session shared memory in portable mode.
+            // Do not change without understanding the Windows portable IPC model.
             set_path_permission(&dir, "F").ok();
         }
         Ok(dir

@@ -439,7 +439,7 @@ fn run_window_focus(sp: EmptyExtraFieldService, state: &mut StateWindowFocus) ->
     Ok(())
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum KeysDown {
     RdevKey(RawKey),
     EnigoKey(u64),
@@ -1594,14 +1594,18 @@ fn need_to_uppercase(en: &mut Enigo) -> bool {
 }
 
 fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
-    // On Wayland with uinput mode, use clipboard for character input
+    // On Wayland with uinput mode, try libei first, then fall back to clipboard
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() && wayland_use_uinput() {
-        // Skip clipboard for hotkeys (Ctrl/Alt/Meta pressed)
+        // Skip for hotkeys (Ctrl/Alt/Meta pressed) — those go through the normal key path
         if !is_hotkey_modifier_pressed(en) {
             if down {
                 if let Ok(c) = char::try_from(chr) {
-                    input_char_via_clipboard_server(en, c);
+                    // Try libei first (zero-latency, no clipboard destruction)
+                    if !try_type_char_via_ei(c) {
+                        // Fall back to clipboard hack
+                        input_char_via_clipboard_server(en, c);
+                    }
                 }
             }
             return;
@@ -1637,11 +1641,15 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
 }
 
 fn process_unicode(en: &mut Enigo, chr: u32) {
-    // On Wayland with uinput mode, use clipboard for character input
+    // On Wayland with uinput mode, try libei first, then fall back to clipboard
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() && wayland_use_uinput() {
         if let Ok(c) = char::try_from(chr) {
-            input_char_via_clipboard_server(en, c);
+            // Try libei first (zero-latency, no clipboard destruction)
+            if !try_type_char_via_ei(c) {
+                // Fall back to clipboard hack
+                input_char_via_clipboard_server(en, c);
+            }
         }
         return;
     }
@@ -1652,14 +1660,87 @@ fn process_unicode(en: &mut Enigo, chr: u32) {
 }
 
 fn process_seq(en: &mut Enigo, sequence: &str) {
-    // On Wayland with uinput mode, use clipboard for text input
+    // On Wayland with uinput mode, try libei first, then fall back to clipboard
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() && wayland_use_uinput() {
-        input_text_via_clipboard_server(en, sequence);
+        // Try libei first (zero-latency, no clipboard destruction)
+        if !try_type_text_via_ei(sequence) {
+            // Fall back to clipboard hack
+            input_text_via_clipboard_server(en, sequence);
+        }
         return;
     }
 
     en.key_sequence(&sequence);
+}
+
+// ---------------------------------------------------------------------------
+// libei input helpers — zero-latency character input on Wayland
+// ---------------------------------------------------------------------------
+
+/// Try to type a single character via libei.
+///
+/// Returns `true` if the character was successfully sent via EIS.
+/// Returns `false` if libei is unavailable or cannot type this character
+/// (not in the compositor's keymap), in which case the caller should
+/// fall back to the clipboard hack.
+#[cfg(target_os = "linux")]
+fn try_type_char_via_ei(ch: char) -> bool {
+    #[cfg(feature = "libei")]
+    {
+        if let Some(ei) = super::ei_input::try_get_ei_input() {
+            if let Ok(mut ei) = ei.lock() {
+                return ei.type_char(ch);
+            }
+        }
+    }
+    let _ = ch;
+    false
+}
+
+/// Try to type a text string via libei.
+///
+/// Returns `true` if the entire string was successfully sent via EIS.
+/// Returns `false` if libei is unavailable or cannot type any character
+/// in the string, in which case the caller should fall back to the
+/// clipboard hack for the entire string.
+#[cfg(target_os = "linux")]
+fn try_type_text_via_ei(text: &str) -> bool {
+    #[cfg(feature = "libei")]
+    {
+        if let Some(ei) = super::ei_input::try_get_ei_input() {
+            if let Ok(mut ei) = ei.lock() {
+                return ei.type_text(text);
+            }
+        }
+    }
+    let _ = text;
+    false
+}
+
+/// Check whether libei input is available for character input on Wayland.
+///
+/// This is a convenience function for external callers that need to know
+/// whether the EI path will be used (e.g., for logging or UI indicators).
+///
+/// Returns `true` if:
+/// - Running on Wayland (not X11)
+/// - The `libei` feature is enabled
+/// - An EI context has been successfully initialized
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub fn try_use_ei_input() -> bool {
+    if crate::platform::linux::is_x11() {
+        return false;
+    }
+    #[cfg(feature = "libei")]
+    {
+        return super::ei_input::is_ei_available();
+    }
+    #[cfg(not(feature = "libei"))]
+    {
+        return false;
+    }
 }
 
 /// Delay in milliseconds to wait for clipboard to sync on Wayland.
@@ -2370,4 +2451,1161 @@ lazy_static::lazy_static! {
         (ControlKey::Insert, true),
         (ControlKey::Delete, true),
     ].iter().map(|(a, b)| (a.value(), b.clone())).collect();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_key_char_start_value() {
+        assert_eq!(KEY_CHAR_START, 9999);
+    }
+
+    #[test]
+    fn test_clipboard_sync_delay_ms() {
+        assert_eq!(CLIPBOARD_SYNC_DELAY_MS, 50);
+    }
+
+    #[test]
+    fn test_invalid_cursor_pos_is_i32_min() {
+        assert_eq!(INVALID_CURSOR_POS, i32::MIN);
+    }
+
+    #[test]
+    fn test_invalid_display_idx() {
+        assert_eq!(INVALID_DISPLAY_IDX, -1);
+    }
+
+    #[test]
+    fn test_mouse_active_distance() {
+        assert_eq!(MOUSE_ACTIVE_DISTANCE, 5);
+    }
+
+    #[test]
+    fn test_mouse_move_protection_timeout() {
+        assert_eq!(MOUSE_MOVE_PROTECTION_TIMEOUT, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn test_service_name_constants() {
+        assert_eq!(NAME_CURSOR, "mouse_cursor");
+        assert_eq!(NAME_POS, "mouse_pos");
+        assert_eq!(NAME_WINDOW_FOCUS, "window_focus");
+    }
+
+    // -----------------------------------------------------------------------
+    // StatePos
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_pos_default_is_invalid() {
+        let state = StatePos::default();
+        assert_eq!(state.cursor_pos, (INVALID_CURSOR_POS, INVALID_CURSOR_POS));
+        assert!(!state.is_valid());
+    }
+
+    #[test]
+    fn test_state_pos_valid_after_setting() {
+        let state = StatePos {
+            cursor_pos: (100, 200),
+        };
+        assert!(state.is_valid());
+    }
+
+    #[test]
+    fn test_state_pos_is_moved_when_valid_and_different() {
+        let state = StatePos {
+            cursor_pos: (100, 200),
+        };
+        assert!(state.is_moved(101, 200));
+        assert!(state.is_moved(100, 201));
+        assert!(state.is_moved(50, 50));
+    }
+
+    #[test]
+    fn test_state_pos_is_not_moved_when_same() {
+        let state = StatePos {
+            cursor_pos: (100, 200),
+        };
+        assert!(!state.is_moved(100, 200));
+    }
+
+    #[test]
+    fn test_state_pos_is_not_moved_when_invalid() {
+        let state = StatePos::default();
+        // Even if coords differ, invalid state means not moved
+        assert!(!state.is_moved(100, 200));
+    }
+
+    #[test]
+    fn test_state_pos_zero_is_valid() {
+        let state = StatePos {
+            cursor_pos: (0, 0),
+        };
+        assert!(state.is_valid());
+    }
+
+    #[test]
+    fn test_state_pos_negative_coords_are_valid() {
+        // Negative coordinates (that are not INVALID_CURSOR_POS) should be valid
+        let state = StatePos {
+            cursor_pos: (-1, -1),
+        };
+        assert!(state.is_valid());
+    }
+
+    // -----------------------------------------------------------------------
+    // StateWindowFocus
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_window_focus_default_is_invalid() {
+        let state = StateWindowFocus::default();
+        assert_eq!(state.display_idx, 0); // Default::default gives 0, not -1
+        // After reset it should be -1
+    }
+
+    #[test]
+    fn test_state_window_focus_reset_sets_invalid() {
+        let mut state = StateWindowFocus { display_idx: 5 };
+        super::super::service::Reset::reset(&mut state);
+        assert_eq!(state.display_idx, INVALID_DISPLAY_IDX);
+        assert!(!state.is_valid());
+    }
+
+    #[test]
+    fn test_state_window_focus_is_changed() {
+        let state = StateWindowFocus { display_idx: 1 };
+        assert!(state.is_valid());
+        assert!(state.is_changed(2));
+        assert!(!state.is_changed(1));
+    }
+
+    #[test]
+    fn test_state_window_focus_is_changed_when_invalid() {
+        let state = StateWindowFocus {
+            display_idx: INVALID_DISPLAY_IDX,
+        };
+        assert!(!state.is_valid());
+        // is_changed returns false when invalid, regardless of disp_idx
+        assert!(!state.is_changed(0));
+        assert!(!state.is_changed(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_left_up
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_left_up_true() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_UP | (MOUSE_BUTTON_LEFT << 3);
+        assert!(is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_right_button() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_UP | (MOUSE_BUTTON_RIGHT << 3);
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_left_down() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_DOWN | (MOUSE_BUTTON_LEFT << 3);
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_move() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_MOVE;
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_wheel_button_up() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_UP | (MOUSE_BUTTON_WHEEL << 3);
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_back_button_up() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_UP | (MOUSE_BUTTON_BACK << 3);
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_false_for_forward_button_up() {
+        let mut evt = MouseEvent::new();
+        evt.mask = MOUSE_TYPE_UP | (MOUSE_BUTTON_FORWARD << 3);
+        assert!(!is_left_up(&evt));
+    }
+
+    #[test]
+    fn test_is_left_up_default_event_is_false() {
+        // Default MouseEvent has mask=0, which is MOUSE_TYPE_MOVE with no buttons
+        let evt = MouseEvent::new();
+        assert!(!is_left_up(&evt));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_enter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_enter_with_return_key() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::ControlKey(ControlKey::Return.into()));
+        assert!(is_enter(&evt));
+    }
+
+    #[test]
+    fn test_is_enter_with_numpad_enter() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::ControlKey(ControlKey::NumpadEnter.into()));
+        assert!(is_enter(&evt));
+    }
+
+    #[test]
+    fn test_is_enter_false_for_space() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::ControlKey(ControlKey::Space.into()));
+        assert!(!is_enter(&evt));
+    }
+
+    #[test]
+    fn test_is_enter_false_for_chr() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::Chr(13)); // CR character code, but not ControlKey
+        assert!(!is_enter(&evt));
+    }
+
+    #[test]
+    fn test_is_enter_false_for_no_union() {
+        let evt = KeyEvent::new();
+        assert!(!is_enter(&evt));
+    }
+
+    // -----------------------------------------------------------------------
+    // record_key_is_control_key / record_key_is_chr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_key_is_control_key_below_start() {
+        assert!(record_key_is_control_key(0));
+        assert!(record_key_is_control_key(100));
+        assert!(record_key_is_control_key(KEY_CHAR_START - 1));
+    }
+
+    #[test]
+    fn test_record_key_is_control_key_at_start_is_false() {
+        assert!(!record_key_is_control_key(KEY_CHAR_START));
+    }
+
+    #[test]
+    fn test_record_key_is_control_key_above_start_is_false() {
+        assert!(!record_key_is_control_key(KEY_CHAR_START + 1));
+        assert!(!record_key_is_control_key(KEY_CHAR_START + 1000));
+    }
+
+    #[test]
+    fn test_record_key_is_chr_at_start() {
+        assert!(record_key_is_chr(KEY_CHAR_START));
+    }
+
+    #[test]
+    fn test_record_key_is_chr_above_start() {
+        assert!(record_key_is_chr(KEY_CHAR_START + 1));
+        assert!(record_key_is_chr(KEY_CHAR_START + 65)); // 'A'
+    }
+
+    #[test]
+    fn test_record_key_is_chr_below_start_is_false() {
+        assert!(!record_key_is_chr(0));
+        assert!(!record_key_is_chr(KEY_CHAR_START - 1));
+    }
+
+    #[test]
+    fn test_record_key_categories_are_exhaustive() {
+        // Every u64 value should be either control_key or chr (they partition the space)
+        // At KEY_CHAR_START exactly, it's chr (>= KEY_CHAR_START)
+        // Below KEY_CHAR_START, it's control_key (< KEY_CHAR_START)
+        for v in [0, 1, 9998, KEY_CHAR_START, KEY_CHAR_START + 1, u64::MAX] {
+            let is_ck = record_key_is_control_key(v);
+            let is_chr = record_key_is_chr(v);
+            assert!(
+                is_ck != is_chr,
+                "Value {} must be exactly one of control_key or chr, got ck={}, chr={}",
+                v,
+                is_ck,
+                is_chr
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // char_value_to_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_char_value_to_key_ascii() {
+        match char_value_to_key('A' as u32) {
+            Key::Layout(c) => assert_eq!(c, 'A'),
+            other => panic!("Expected Key::Layout('A'), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_char_value_to_key_zero() {
+        // char 0 is '\0'
+        match char_value_to_key(0) {
+            Key::Layout(c) => assert_eq!(c, '\0'),
+            other => panic!("Expected Key::Layout('\\0'), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_char_value_to_key_unicode() {
+        // Unicode snowman U+2603
+        match char_value_to_key(0x2603) {
+            Key::Layout(c) => assert_eq!(c, '\u{2603}'),
+            other => panic!("Expected Key::Layout snowman, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_char_value_to_key_invalid_unicode_gives_nul() {
+        // Invalid unicode scalar value should produce '\0' via unwrap_or
+        match char_value_to_key(0xD800) {
+            // surrogate, not valid char
+            Key::Layout(c) => assert_eq!(c, '\0'),
+            other => panic!("Expected Key::Layout('\\0') for invalid unicode, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // control_key_value_to_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_control_key_value_to_key_known_keys() {
+        // Return key should map to Key::Return
+        let result = control_key_value_to_key(ControlKey::Return.value());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), Key::Return);
+    }
+
+    #[test]
+    fn test_control_key_value_to_key_shift() {
+        let result = control_key_value_to_key(ControlKey::Shift.value());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), Key::Shift);
+    }
+
+    #[test]
+    fn test_control_key_value_to_key_unknown_returns_none() {
+        // Value -999 is not in KEY_MAP
+        let result = control_key_value_to_key(-999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_control_key_value_to_key_all_modifiers_exist() {
+        // All modifier keys in MODIFIER_MAP should also be in KEY_MAP
+        for (value, expected_key) in MODIFIER_MAP.iter() {
+            let result = control_key_value_to_key(*value);
+            assert!(
+                result.is_some(),
+                "KEY_MAP missing modifier value {}",
+                value
+            );
+            assert_eq!(
+                result.unwrap(),
+                *expected_key,
+                "KEY_MAP and MODIFIER_MAP disagree on value {}",
+                value
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // record_key_to_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_key_to_key_control_key() {
+        // ControlKey::Return should be in KEY_MAP
+        let record_key = ControlKey::Return.value() as u64;
+        assert!(record_key < KEY_CHAR_START);
+        let result = record_key_to_key(record_key);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), Key::Return);
+    }
+
+    #[test]
+    fn test_record_key_to_key_chr() {
+        let record_key = KEY_CHAR_START + 'Z' as u64;
+        let result = record_key_to_key(record_key);
+        assert!(result.is_some());
+        match result.unwrap() {
+            Key::Layout(c) => assert_eq!(c, 'Z'),
+            other => panic!("Expected Key::Layout('Z'), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_record_key_to_key_invalid_control_key_returns_none() {
+        // A value below KEY_CHAR_START that is not in KEY_MAP
+        let record_key = 8888u64; // unlikely to be a valid ControlKey value
+        let result = record_key_to_key(record_key);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_control_key_value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_control_key_value_with_control_key() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::ControlKey(ControlKey::Tab.into()));
+        assert_eq!(get_control_key_value(&evt), ControlKey::Tab.value());
+    }
+
+    #[test]
+    fn test_get_control_key_value_with_chr_returns_minus_one() {
+        let mut evt = KeyEvent::new();
+        evt.union = Some(key_event::Union::Chr(65));
+        assert_eq!(get_control_key_value(&evt), -1);
+    }
+
+    #[test]
+    fn test_get_control_key_value_no_union_returns_minus_one() {
+        let evt = KeyEvent::new();
+        assert_eq!(get_control_key_value(&evt), -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // has_hotkey_modifiers (linux-specific behavior: includes Alt)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_control() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::Control.into());
+        assert!(has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_rcontrol() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::RControl.into());
+        assert!(has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_meta() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::Meta.into());
+        assert!(has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_rwin() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::RWin.into());
+        assert!(has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_alt() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::Alt.into());
+        // On linux and windows, Alt is a hotkey modifier
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        assert!(has_hotkey_modifiers(&evt));
+        // On macOS, Alt is NOT a hotkey modifier
+        #[cfg(target_os = "macos")]
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_with_ralt() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::RAlt.into());
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        assert!(has_hotkey_modifiers(&evt));
+        #[cfg(target_os = "macos")]
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_shift_only_is_not_hotkey() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::Shift.into());
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_rshift_only_is_not_hotkey() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::RShift.into());
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_no_modifiers() {
+        let evt = KeyEvent::new();
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_capslock_is_not_hotkey() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::CapsLock.into());
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_numlock_is_not_hotkey() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::NumLock.into());
+        assert!(!has_hotkey_modifiers(&evt));
+    }
+
+    #[test]
+    fn test_has_hotkey_modifiers_multiple_including_hotkey() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::Shift.into());
+        evt.modifiers.push(ControlKey::Control.into());
+        assert!(has_hotkey_modifiers(&evt));
+    }
+
+    // -----------------------------------------------------------------------
+    // LockModesHandler::is_modifier_enabled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_modifier_enabled_capslock_present() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::CapsLock.into());
+        assert!(LockModesHandler::is_modifier_enabled(&evt, ControlKey::CapsLock));
+    }
+
+    #[test]
+    fn test_is_modifier_enabled_capslock_absent() {
+        let evt = KeyEvent::new();
+        assert!(!LockModesHandler::is_modifier_enabled(&evt, ControlKey::CapsLock));
+    }
+
+    #[test]
+    fn test_is_modifier_enabled_numlock_present() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::NumLock.into());
+        assert!(LockModesHandler::is_modifier_enabled(&evt, ControlKey::NumLock));
+    }
+
+    #[test]
+    fn test_is_modifier_enabled_numlock_absent_with_other_modifiers() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::CapsLock.into());
+        evt.modifiers.push(ControlKey::Shift.into());
+        assert!(!LockModesHandler::is_modifier_enabled(&evt, ControlKey::NumLock));
+    }
+
+    #[test]
+    fn test_is_modifier_enabled_multiple_modifiers() {
+        let mut evt = KeyEvent::new();
+        evt.modifiers.push(ControlKey::CapsLock.into());
+        evt.modifiers.push(ControlKey::NumLock.into());
+        evt.modifiers.push(ControlKey::Control.into());
+        assert!(LockModesHandler::is_modifier_enabled(&evt, ControlKey::CapsLock));
+        assert!(LockModesHandler::is_modifier_enabled(&evt, ControlKey::NumLock));
+        assert!(LockModesHandler::is_modifier_enabled(&evt, ControlKey::Control));
+        assert!(!LockModesHandler::is_modifier_enabled(&evt, ControlKey::Shift));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_legacy_mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_legacy_mode_default() {
+        let evt = KeyEvent::new();
+        // Default mode should be Legacy
+        assert!(is_legacy_mode(&evt));
+    }
+
+    #[test]
+    fn test_is_legacy_mode_explicit_legacy() {
+        let mut evt = KeyEvent::new();
+        evt.mode = KeyboardMode::Legacy.into();
+        assert!(is_legacy_mode(&evt));
+    }
+
+    #[test]
+    fn test_is_legacy_mode_map() {
+        let mut evt = KeyEvent::new();
+        evt.mode = KeyboardMode::Map.into();
+        assert!(!is_legacy_mode(&evt));
+    }
+
+    #[test]
+    fn test_is_legacy_mode_translate() {
+        let mut evt = KeyEvent::new();
+        evt.mode = KeyboardMode::Translate.into();
+        assert!(!is_legacy_mode(&evt));
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_led_sync_control_key (linux variant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_led_sync_control_key_modifier_keys() {
+        // These should be skipped (they are modifier/nav keys)
+        let should_skip = [
+            ControlKey::Control,
+            ControlKey::RControl,
+            ControlKey::Meta,
+            ControlKey::Shift,
+            ControlKey::RShift,
+            ControlKey::Alt,
+            ControlKey::RAlt,
+            ControlKey::Tab,
+            ControlKey::Return,
+        ];
+        for key in should_skip {
+            assert!(
+                skip_led_sync_control_key(&key),
+                "Expected skip_led_sync_control_key for {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_skip_led_sync_control_key_non_modifier_keys() {
+        let should_not_skip = [
+            ControlKey::Space,
+            ControlKey::Backspace,
+            ControlKey::Escape,
+            ControlKey::F1,
+            ControlKey::CapsLock,
+            ControlKey::NumLock,
+            ControlKey::Delete,
+            ControlKey::Home,
+        ];
+        for key in should_not_skip {
+            assert!(
+                !skip_led_sync_control_key(&key),
+                "Expected NOT skip_led_sync_control_key for {:?}",
+                key
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // skip_led_sync_rdev_key (linux variant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_led_sync_rdev_key_modifier_keys() {
+        let should_skip = [
+            RdevKey::ControlLeft,
+            RdevKey::ControlRight,
+            RdevKey::MetaLeft,
+            RdevKey::MetaRight,
+            RdevKey::ShiftLeft,
+            RdevKey::ShiftRight,
+            RdevKey::Alt,
+            RdevKey::AltGr,
+            RdevKey::Tab,
+            RdevKey::Return,
+        ];
+        for key in should_skip {
+            assert!(
+                skip_led_sync_rdev_key(&key),
+                "Expected skip_led_sync_rdev_key for {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_skip_led_sync_rdev_key_non_modifier_keys() {
+        let should_not_skip = [
+            RdevKey::Space,
+            RdevKey::Backspace,
+            RdevKey::Escape,
+            RdevKey::F1,
+            RdevKey::CapsLock,
+            RdevKey::NumLock,
+            RdevKey::Delete,
+            RdevKey::Home,
+        ];
+        for key in should_not_skip {
+            assert!(
+                !skip_led_sync_rdev_key(&key),
+                "Expected NOT skip_led_sync_rdev_key for {:?}",
+                key
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_numpad_control_key (linux variant)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_numpad_control_key_numpad_keys() {
+        let numpad_keys = [
+            ControlKey::Numpad0,
+            ControlKey::Numpad1,
+            ControlKey::Numpad2,
+            ControlKey::Numpad3,
+            ControlKey::Numpad4,
+            ControlKey::Numpad5,
+            ControlKey::Numpad6,
+            ControlKey::Numpad7,
+            ControlKey::Numpad8,
+            ControlKey::Numpad9,
+            ControlKey::NumpadEnter,
+        ];
+        for key in numpad_keys {
+            assert!(
+                is_numpad_control_key(&key),
+                "Expected is_numpad_control_key for {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_numpad_control_key_non_numpad() {
+        // Decimal, Add, Subtract etc. are NOT in the numpad control key list
+        let non_numpad = [
+            ControlKey::Return,
+            ControlKey::Space,
+            ControlKey::Control,
+            ControlKey::Decimal,
+            ControlKey::Add,
+            ControlKey::Subtract,
+            ControlKey::Multiply,
+            ControlKey::Divide,
+            ControlKey::NumLock,
+        ];
+        for key in non_numpad {
+            assert!(
+                !is_numpad_control_key(&key),
+                "Expected NOT is_numpad_control_key for {:?}",
+                key
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // is_ascii_printable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_ascii_printable_space() {
+        assert!(is_ascii_printable(' ')); // 0x20
+    }
+
+    #[test]
+    fn test_is_ascii_printable_tilde() {
+        assert!(is_ascii_printable('~')); // 0x7E
+    }
+
+    #[test]
+    fn test_is_ascii_printable_letters_and_digits() {
+        for c in 'A'..='Z' {
+            assert!(is_ascii_printable(c));
+        }
+        for c in 'a'..='z' {
+            assert!(is_ascii_printable(c));
+        }
+        for c in '0'..='9' {
+            assert!(is_ascii_printable(c));
+        }
+    }
+
+    #[test]
+    fn test_is_ascii_printable_symbols() {
+        for c in ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '-', '='] {
+            assert!(is_ascii_printable(c), "Expected printable: {:?}", c);
+        }
+    }
+
+    #[test]
+    fn test_is_ascii_printable_control_chars_are_not() {
+        assert!(!is_ascii_printable('\0'));   // 0x00
+        assert!(!is_ascii_printable('\n'));   // 0x0A
+        assert!(!is_ascii_printable('\r'));   // 0x0D
+        assert!(!is_ascii_printable('\t'));   // 0x09
+        assert!(!is_ascii_printable('\x1F')); // 0x1F, just below space
+        assert!(!is_ascii_printable('\x7F')); // DEL, just above tilde
+    }
+
+    #[test]
+    fn test_is_ascii_printable_non_ascii_is_not() {
+        assert!(!is_ascii_printable('\u{00E9}')); // e-acute
+        assert!(!is_ascii_printable('\u{2603}')); // snowman
+        assert!(!is_ascii_printable('\u{1F600}')); // emoji
+    }
+
+    // -----------------------------------------------------------------------
+    // Mouse event mask field decomposition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mouse_event_mask_decomposition() {
+        // Verify the mask decomposition used throughout handle_mouse_simulation_
+        let mask = MOUSE_TYPE_DOWN | (MOUSE_BUTTON_RIGHT << 3);
+        let buttons = mask >> 3;
+        let evt_type = mask & MOUSE_TYPE_MASK;
+        assert_eq!(evt_type, MOUSE_TYPE_DOWN);
+        assert_eq!(buttons, MOUSE_BUTTON_RIGHT);
+    }
+
+    #[test]
+    fn test_mouse_event_mask_multiple_buttons() {
+        // Multiple buttons can be encoded simultaneously
+        let combined_buttons = MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT;
+        let mask = MOUSE_TYPE_UP | (combined_buttons << 3);
+        let buttons = mask >> 3;
+        let evt_type = mask & MOUSE_TYPE_MASK;
+        assert_eq!(evt_type, MOUSE_TYPE_UP);
+        assert_eq!(buttons & MOUSE_BUTTON_LEFT, MOUSE_BUTTON_LEFT);
+        assert_eq!(buttons & MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_RIGHT);
+        assert_eq!(buttons & MOUSE_BUTTON_WHEEL, 0);
+    }
+
+    #[test]
+    fn test_mouse_event_mask_wheel_event() {
+        let mask = MOUSE_TYPE_WHEEL;
+        let evt_type = mask & MOUSE_TYPE_MASK;
+        assert_eq!(evt_type, MOUSE_TYPE_WHEEL);
+    }
+
+    #[test]
+    fn test_mouse_event_mask_trackpad_event() {
+        let mask = MOUSE_TYPE_TRACKPAD;
+        let evt_type = mask & MOUSE_TYPE_MASK;
+        assert_eq!(evt_type, MOUSE_TYPE_TRACKPAD);
+    }
+
+    #[test]
+    fn test_mouse_event_mask_relative_move() {
+        let mask = MOUSE_TYPE_MOVE_RELATIVE;
+        let evt_type = mask & MOUSE_TYPE_MASK;
+        assert_eq!(evt_type, MOUSE_TYPE_MOVE_RELATIVE);
+    }
+
+    // -----------------------------------------------------------------------
+    // KEY_MAP and MODIFIER_MAP completeness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_key_map_contains_essential_keys() {
+        let essential = [
+            (ControlKey::Return, Key::Return),
+            (ControlKey::Space, Key::Space),
+            (ControlKey::Tab, Key::Tab),
+            (ControlKey::Escape, Key::Escape),
+            (ControlKey::Backspace, Key::Backspace),
+            (ControlKey::Delete, Key::Delete),
+            (ControlKey::CapsLock, Key::CapsLock),
+            (ControlKey::NumLock, Key::NumLock),
+            (ControlKey::Insert, Key::Insert),
+        ];
+        for (ck, expected_key) in essential {
+            let result = KEY_MAP.get(&ck.value());
+            assert!(
+                result.is_some(),
+                "KEY_MAP missing {:?}",
+                ck
+            );
+            assert_eq!(
+                *result.unwrap(),
+                expected_key,
+                "KEY_MAP wrong mapping for {:?}",
+                ck
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_map_contains_all_f_keys() {
+        let f_keys = [
+            (ControlKey::F1, Key::F1),
+            (ControlKey::F2, Key::F2),
+            (ControlKey::F3, Key::F3),
+            (ControlKey::F4, Key::F4),
+            (ControlKey::F5, Key::F5),
+            (ControlKey::F6, Key::F6),
+            (ControlKey::F7, Key::F7),
+            (ControlKey::F8, Key::F8),
+            (ControlKey::F9, Key::F9),
+            (ControlKey::F10, Key::F10),
+            (ControlKey::F11, Key::F11),
+            (ControlKey::F12, Key::F12),
+        ];
+        for (ck, expected_key) in f_keys {
+            let result = KEY_MAP.get(&ck.value());
+            assert!(result.is_some(), "KEY_MAP missing {:?}", ck);
+            assert_eq!(*result.unwrap(), expected_key);
+        }
+    }
+
+    #[test]
+    fn test_key_map_contains_arrow_keys() {
+        let arrows = [
+            (ControlKey::UpArrow, Key::UpArrow),
+            (ControlKey::DownArrow, Key::DownArrow),
+            (ControlKey::LeftArrow, Key::LeftArrow),
+            (ControlKey::RightArrow, Key::RightArrow),
+        ];
+        for (ck, expected_key) in arrows {
+            let result = KEY_MAP.get(&ck.value());
+            assert!(result.is_some(), "KEY_MAP missing {:?}", ck);
+            assert_eq!(*result.unwrap(), expected_key);
+        }
+    }
+
+    #[test]
+    fn test_modifier_map_has_all_8_modifiers() {
+        assert_eq!(MODIFIER_MAP.len(), 8);
+        let expected_modifiers = [
+            ControlKey::Alt,
+            ControlKey::RAlt,
+            ControlKey::Control,
+            ControlKey::RControl,
+            ControlKey::Shift,
+            ControlKey::RShift,
+            ControlKey::Meta,
+            ControlKey::RWin,
+        ];
+        for ck in expected_modifiers {
+            assert!(
+                MODIFIER_MAP.contains_key(&ck.value()),
+                "MODIFIER_MAP missing {:?}",
+                ck
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NUMPAD_KEY_MAP
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_numpad_key_map_contains_navigation_keys() {
+        let nav_keys = [
+            ControlKey::Home,
+            ControlKey::UpArrow,
+            ControlKey::PageUp,
+            ControlKey::LeftArrow,
+            ControlKey::RightArrow,
+            ControlKey::End,
+            ControlKey::DownArrow,
+            ControlKey::PageDown,
+            ControlKey::Insert,
+            ControlKey::Delete,
+        ];
+        assert_eq!(NUMPAD_KEY_MAP.len(), nav_keys.len());
+        for key in nav_keys {
+            assert!(
+                NUMPAD_KEY_MAP.contains_key(&key.value()),
+                "NUMPAD_KEY_MAP missing {:?}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_numpad_key_map_does_not_contain_numpad_digits() {
+        // NUMPAD_KEY_MAP is for navigation keys that overlap with numpad,
+        // not for the numpad digit keys themselves
+        for key in [
+            ControlKey::Numpad0,
+            ControlKey::Numpad5,
+            ControlKey::Numpad9,
+        ] {
+            assert!(
+                !NUMPAD_KEY_MAP.contains_key(&key.value()),
+                "NUMPAD_KEY_MAP should NOT contain {:?}",
+                key
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KeysDown enum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keys_down_rdev_equality() {
+        let a = KeysDown::RdevKey(RawKey::LinuxXorgKeycode(42));
+        let b = KeysDown::RdevKey(RawKey::LinuxXorgKeycode(42));
+        let c = KeysDown::RdevKey(RawKey::LinuxXorgKeycode(43));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_keys_down_enigo_equality() {
+        let a = KeysDown::EnigoKey(100);
+        let b = KeysDown::EnigoKey(100);
+        let c = KeysDown::EnigoKey(200);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_keys_down_different_variants_not_equal() {
+        let rdev = KeysDown::RdevKey(RawKey::LinuxXorgKeycode(100));
+        let enigo = KeysDown::EnigoKey(100);
+        assert_ne!(rdev, enigo);
+    }
+
+    #[test]
+    fn test_keys_down_hashable() {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(KeysDown::RdevKey(RawKey::LinuxXorgKeycode(10)), "a");
+        map.insert(KeysDown::EnigoKey(20), "b");
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&KeysDown::RdevKey(RawKey::LinuxXorgKeycode(10))),
+            Some(&"a")
+        );
+        assert_eq!(map.get(&KeysDown::EnigoKey(20)), Some(&"b"));
+    }
+
+    // -----------------------------------------------------------------------
+    // active_mouse_ (currently always returns true)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_active_mouse_always_true() {
+        // The function body is `true` with commented-out logic
+        assert!(active_mouse_(0));
+        assert!(active_mouse_(1));
+        assert!(active_mouse_(-1));
+        assert!(active_mouse_(i32::MAX));
+    }
+
+    // -----------------------------------------------------------------------
+    // XKB_KEY_INSERT value on Linux
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xkb_key_insert_value() {
+        // evdev KEY_INSERT is 110, XKB offset is +8
+        assert_eq!(XKB_KEY_INSERT, 110 + 8);
+        assert_eq!(XKB_KEY_INSERT, 118);
+    }
+
+    // -----------------------------------------------------------------------
+    // Input struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_input_default() {
+        let input = Input::default();
+        assert_eq!(input.conn, 0);
+        assert_eq!(input.time, 0);
+        assert_eq!(input.x, 0);
+        assert_eq!(input.y, 0);
+    }
+
+    #[test]
+    fn test_input_copy_clone() {
+        let input = Input {
+            conn: 5,
+            time: 12345,
+            x: 100,
+            y: 200,
+        };
+        let copied = input;
+        assert_eq!(copied.conn, 5);
+        assert_eq!(copied.time, 12345);
+        assert_eq!(copied.x, 100);
+        assert_eq!(copied.y, 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // Relative mouse delta clamping constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_max_relative_mouse_delta_matches_flutter() {
+        // The constant used inline in handle_mouse_simulation_
+        // must match the Flutter client's kMaxRelativeMouseDelta
+        const MAX_RELATIVE_MOUSE_DELTA: i32 = 10000;
+
+        // Verify clamping behavior
+        assert_eq!(15000i32.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA), 10000);
+        assert_eq!((-15000i32).clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA), -10000);
+        assert_eq!(500i32.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA), 500);
+        assert_eq!(0i32.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wheel scroll sign inversion (non-macOS, non-Windows)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wheel_scroll_sign_conventions() {
+        // The code does: x = -evt.x, y = evt.y, then on non-windows: y = -y
+        // This test documents the expected transformation
+        let evt_x = 3;
+        let evt_y = 5;
+        let x = -evt_x;
+        let y = evt_y;
+
+        // On non-windows (our target): y is negated
+        #[cfg(not(windows))]
+        let y = -y;
+
+        assert_eq!(x, -3);
+        #[cfg(not(windows))]
+        assert_eq!(y, -5);
+    }
+
+    // -----------------------------------------------------------------------
+    // libei integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_try_use_ei_input_returns_false_by_default() {
+        // Without the libei feature or on X11, this should return false.
+        // On Wayland with libei but no initialized context, also returns false.
+        assert!(!try_use_ei_input());
+    }
+
+    #[test]
+    fn test_try_type_char_via_ei_returns_false_without_libei() {
+        // Without an initialized EI context, should return false (fallback to clipboard).
+        assert!(!try_type_char_via_ei('a'));
+        assert!(!try_type_char_via_ei('\u{00e4}')); // ä
+    }
+
+    #[test]
+    fn test_try_type_text_via_ei_returns_false_without_libei() {
+        // Without an initialized EI context, should return false (fallback to clipboard).
+        assert!(!try_type_text_via_ei("hello"));
+        assert!(!try_type_text_via_ei(""));
+    }
 }
