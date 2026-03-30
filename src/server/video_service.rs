@@ -1086,6 +1086,7 @@ fn get_encoder_config(
                     height: c.height,
                     quality,
                     keyframe_interval,
+                    hdr: scrap::is_display_hdr(),
                     fps: Some(target_fps as i32),
                 });
             }

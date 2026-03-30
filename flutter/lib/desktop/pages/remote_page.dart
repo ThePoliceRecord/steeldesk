@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 
 import '../../consts.dart';
+import '../../common/widgets/cursor_overlay.dart';
 import '../../common/widgets/overlay.dart';
 import '../../common/widgets/remote_input.dart';
 import '../../common.dart';
@@ -624,8 +625,10 @@ class _RemotePageState extends State<RemotePage>
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
       ),
     );
-    return Stack(
-      children: paints,
+    return CursorPredictionOverlay(
+      child: Stack(
+        children: paints,
+      ),
     );
   }
 

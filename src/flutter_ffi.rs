@@ -1240,6 +1240,23 @@ pub fn main_set_cursor_position(x: i32, y: i32) -> SyncReturn<bool> {
     }
 }
 
+/// Returns the predicted cursor position as a JSON string.
+///
+/// When cursor prediction is active (low-latency mode), this returns the
+/// predicted position ahead of the server-confirmed position. Flutter calls
+/// this each frame to render a local cursor overlay.
+///
+/// # Returns
+/// - `{"x":<int>,"y":<int>,"active":true}` when a predicted position is available
+/// - `{"active":false}` when prediction is inactive or has no data
+pub fn main_get_cursor_prediction() -> SyncReturn<String> {
+    let json = match crate::client::get_cursor_render_position() {
+        Some((x, y)) => format!(r#"{{"x":{},"y":{},"active":true}}"#, x, y),
+        None => r#"{"active":false}"#.to_string(),
+    };
+    SyncReturn(json)
+}
+
 /// Clip cursor to a rectangle (for pointer lock).
 ///
 /// When `enable` is true, the cursor is clipped to the rectangle defined by

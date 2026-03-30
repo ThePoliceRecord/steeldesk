@@ -371,4 +371,191 @@ mod tests {
         argb2101010_to_bgra(&single, &mut dst);
         assert_eq!(dst.len(), 4);
     }
+
+    // -----------------------------------------------------------------------
+    // bgra_to_p010 conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bgra_to_p010_black_2x2() {
+        // 2x2 black image with full alpha.
+        let src = vec![0u8, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let mut dst = Vec::new();
+        scrap::bgra_to_p010(&src, 2, 2, &mut dst);
+
+        // Y plane: 4 samples * 2 bytes = 8 bytes
+        // UV plane: 1 chroma sample pair * 4 bytes = 4 bytes
+        assert_eq!(dst.len(), 12);
+
+        // Black in BT.601: Y = 16, Cb = Cr = 128.
+        // As 10-bit left-shifted: Y = 16 << 2 = 64, Cb = 128 << 2 = 512, Cr = 128 << 2 = 512.
+        for i in 0..4 {
+            let y = u16::from_le_bytes([dst[i * 2], dst[i * 2 + 1]]);
+            assert_eq!(y, 64, "Y sample {i} should be 64 (16 << 2)");
+        }
+        let cb = u16::from_le_bytes([dst[8], dst[9]]);
+        let cr = u16::from_le_bytes([dst[10], dst[11]]);
+        assert_eq!(cb, 512, "Cb should be 512 (128 << 2)");
+        assert_eq!(cr, 512, "Cr should be 512 (128 << 2)");
+    }
+
+    #[test]
+    fn bgra_to_p010_white_2x2() {
+        // 2x2 white image: BGRA = (255, 255, 255, 255).
+        let src = vec![255u8; 16]; // 4 pixels * 4 bytes
+        let mut dst = Vec::new();
+        scrap::bgra_to_p010(&src, 2, 2, &mut dst);
+
+        // White in BT.601: Y = 235 (limited range max).
+        // Y10 = 235 << 2 = 940.
+        for i in 0..4 {
+            let y = u16::from_le_bytes([dst[i * 2], dst[i * 2 + 1]]);
+            // Y = ((66*255 + 129*255 + 25*255 + 128) >> 8) + 16
+            //   = ((16830 + 32895 + 6375 + 128) >> 8) + 16
+            //   = (56228 >> 8) + 16 = 219 + 16 = 235
+            assert_eq!(y, 235 << 2, "Y sample {i} should be 940 (235 << 2)");
+        }
+    }
+
+    #[test]
+    fn bgra_to_p010_output_size() {
+        let width = 4;
+        let height = 4;
+        let src = vec![128u8; width * height * 4];
+        let mut dst = Vec::new();
+        scrap::bgra_to_p010(&src, width, height, &mut dst);
+
+        let expected_y_size = width * height * 2;
+        let expected_uv_size = width * (height / 2) * 2;
+        assert_eq!(dst.len(), expected_y_size + expected_uv_size);
+    }
+
+    #[test]
+    #[should_panic(expected = "width and height must be even")]
+    fn bgra_to_p010_odd_width_panics() {
+        let src = vec![0u8; 3 * 2 * 4];
+        let mut dst = Vec::new();
+        scrap::bgra_to_p010(&src, 3, 2, &mut dst);
+    }
+
+    #[test]
+    #[should_panic(expected = "width and height must be even")]
+    fn bgra_to_p010_odd_height_panics() {
+        let src = vec![0u8; 2 * 3 * 4];
+        let mut dst = Vec::new();
+        scrap::bgra_to_p010(&src, 2, 3, &mut dst);
+    }
+
+    // -----------------------------------------------------------------------
+    // argb2101010_to_p010 conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn argb2101010_to_p010_black_2x2() {
+        // All zeros = black (alpha 0, but alpha is ignored in YUV conversion).
+        let src = vec![0u8; 16]; // 4 pixels
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, 2, 2, &mut dst);
+
+        // Y plane: 4 samples * 2 bytes = 8 bytes
+        // UV plane: 1 chroma sample pair * 4 bytes = 4 bytes
+        assert_eq!(dst.len(), 12);
+
+        // Black: R=G=B=0, Y_10 = 64, Cb = Cr = 512 (limited range offsets).
+        // Left-aligned in 16-bit: Y = 64 << 6 = 4096, Cb = 512 << 6 = 32768, Cr = 512 << 6 = 32768.
+        for i in 0..4 {
+            let y = u16::from_le_bytes([dst[i * 2], dst[i * 2 + 1]]);
+            assert_eq!(y, 64 << 6, "Y sample {i} should be 4096 (64 << 6)");
+        }
+        let cb = u16::from_le_bytes([dst[8], dst[9]]);
+        let cr = u16::from_le_bytes([dst[10], dst[11]]);
+        assert_eq!(cb, 512 << 6, "Cb should be 32768 (512 << 6)");
+        assert_eq!(cr, 512 << 6, "Cr should be 32768 (512 << 6)");
+    }
+
+    #[test]
+    fn argb2101010_to_p010_output_size() {
+        let width = 4;
+        let height = 4;
+        let src = vec![0u8; width * height * 4];
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, width, height, &mut dst);
+
+        let expected_y_size = width * height * 2;
+        let expected_uv_size = width * (height / 2) * 2;
+        assert_eq!(dst.len(), expected_y_size + expected_uv_size);
+    }
+
+    #[test]
+    fn argb2101010_to_p010_white_2x2() {
+        // Full white: R=G=B=1023 (10-bit max), alpha=3.
+        let white: u32 = 0x3FF | (0x3FF << 10) | (0x3FF << 20) | (0x3 << 30);
+        let mut src = Vec::new();
+        for _ in 0..4 {
+            src.extend_from_slice(&white.to_le_bytes());
+        }
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, 2, 2, &mut dst);
+
+        // Y plane: white should be near max limited range (940).
+        for i in 0..4 {
+            let y = u16::from_le_bytes([dst[i * 2], dst[i * 2 + 1]]);
+            let y10 = y >> 6; // extract 10-bit value
+            // BT.2020: Y = ((17224*1023 + 44437*1023 + 3886*1023 + 32768) >> 16) + 64
+            //          = ((65547*1023 + 32768) >> 16) + 64
+            //          = ((67044381 + 32768) >> 16) + 64
+            //          = 1023 + 64 but clamped to 940
+            // Actually: (17224+44437+3886)*1023 = 65547*1023 = 67,044,681
+            // (67,044,681 + 32768) >> 16 = 67,077,449 >> 16 = 1023
+            // + 64 = 1087 clamped to 940
+            assert_eq!(y10, 940, "Y sample {i} should be 940 (limited range max)");
+        }
+    }
+
+    #[test]
+    fn argb2101010_to_p010_known_color() {
+        // Pure red: R=1023, G=0, B=0 (10-bit).
+        let red: u32 = 0 | (0 << 10) | (0x3FF << 20) | (0x3 << 30);
+        let mut src = Vec::new();
+        for _ in 0..4 {
+            src.extend_from_slice(&red.to_le_bytes());
+        }
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, 2, 2, &mut dst);
+
+        // For pure red with BT.2020:
+        // Y = (17224*1023 + 0 + 0 + 32768) >> 16 + 64
+        //   = (17,612,152 + 32768) >> 16 + 64
+        //   = 17,644,920 >> 16 + 64
+        //   = 269 + 64 = 333
+        let y = u16::from_le_bytes([dst[0], dst[1]]);
+        let y10 = y >> 6;
+        assert_eq!(y10, 333, "Y for pure red should be 333");
+
+        // Cb should be < 512 (blue component is 0, red pulls Cb down)
+        let cb = u16::from_le_bytes([dst[8], dst[9]]);
+        let cb10 = cb >> 6;
+        assert!(cb10 < 512, "Cb for pure red should be below neutral (512), got {cb10}");
+
+        // Cr should be > 512 (red component pushes Cr up)
+        let cr = u16::from_le_bytes([dst[10], dst[11]]);
+        let cr10 = cr >> 6;
+        assert!(cr10 > 512, "Cr for pure red should be above neutral (512), got {cr10}");
+    }
+
+    #[test]
+    #[should_panic(expected = "width and height must be even")]
+    fn argb2101010_to_p010_odd_dimensions_panics() {
+        let src = vec![0u8; 3 * 3 * 4];
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, 3, 3, &mut dst);
+    }
+
+    #[test]
+    #[should_panic(expected = "ARGB2101010 data length must be a multiple of 4")]
+    fn argb2101010_to_p010_bad_length_panics() {
+        let src = vec![0u8; 5];
+        let mut dst = Vec::new();
+        scrap::argb2101010_to_p010(&src, 2, 2, &mut dst);
+    }
 }

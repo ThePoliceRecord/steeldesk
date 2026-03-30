@@ -678,6 +678,7 @@ impl RendezvousMediator {
             nat_type: nat_type.into(),
             version: crate::VERSION.to_owned(),
             socket_addr_v6,
+            quic_cert: crate::transport::quic::get_quic_cert_der().into(),
             ..Default::default()
         };
         if ph.udp_port > 0 {

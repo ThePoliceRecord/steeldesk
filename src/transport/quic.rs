@@ -28,12 +28,79 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use hbb_common::ResultType;
 
 use super::Transport;
+
+// ──────────────────────────────────────────────────────────────────────
+// QUIC certificate cache (available regardless of quic-transport feature)
+// ──────────────────────────────────────────────────────────────────────
+
+lazy_static::lazy_static! {
+    /// Cached self-signed QUIC certificate and private key `(cert_der, key_der)`.
+    ///
+    /// Generated once on first access and reused for the lifetime of the
+    /// process. Both peers exchange their `cert_der` during the rendezvous
+    /// handshake so the QUIC TLS handshake can verify the remote endpoint.
+    static ref QUIC_CERT: RwLock<Option<(Vec<u8>, Vec<u8>)>> = RwLock::new(None);
+}
+
+/// Get or generate the cached self-signed QUIC certificate.
+///
+/// Returns `(cert_der, key_der)`. The certificate is generated once and
+/// cached for the lifetime of the process. Thread-safe.
+///
+/// # Panics
+///
+/// Panics if `rcgen` cert generation fails (should not happen with the
+/// default "rustdesk" subject name) or if the RwLock is poisoned.
+#[cfg(feature = "quic-transport")]
+pub fn get_or_generate_quic_cert() -> (Vec<u8>, Vec<u8>) {
+    // Fast path: cert already generated.
+    {
+        let guard = QUIC_CERT.read().unwrap();
+        if let Some(ref cert) = *guard {
+            return cert.clone();
+        }
+    }
+    // Slow path: generate and cache.
+    let mut guard = QUIC_CERT.write().unwrap();
+    // Double-check after acquiring write lock.
+    if let Some(ref cert) = *guard {
+        return cert.clone();
+    }
+    let cert = inner::generate_self_signed_cert()
+        .expect("failed to generate self-signed QUIC certificate");
+    *guard = Some(cert.clone());
+    cert
+}
+
+/// Stub version for builds without `quic-transport`.
+///
+/// Returns an empty `(cert_der, key_der)` pair. The empty cert will
+/// cause `try_quic_connection` to skip the QUIC attempt gracefully.
+#[cfg(not(feature = "quic-transport"))]
+pub fn get_or_generate_quic_cert() -> (Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new())
+}
+
+/// Get the DER-encoded self-signed certificate for QUIC transport.
+///
+/// This is the certificate that should be sent to peers during the
+/// rendezvous handshake. The peer uses it to verify our QUIC TLS endpoint.
+pub fn get_quic_cert_der() -> Vec<u8> {
+    get_or_generate_quic_cert().0
+}
+
+/// Clear the cached QUIC certificate (for testing).
+#[cfg(test)]
+pub fn clear_quic_cert_cache() {
+    let mut guard = QUIC_CERT.write().unwrap();
+    *guard = None;
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Real implementation (feature = "quic-transport")
@@ -467,11 +534,133 @@ pub use inner::QuicTransport;
 // Tests (feature-gated)
 // ──────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────
+// Tests: cert caching (always available, no feature gate)
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod cert_tests {
+    use super::*;
+
+    #[test]
+    fn get_or_generate_quic_cert_returns_consistent_value() {
+        // Two calls should return the same cert (cached).
+        let (cert1, key1) = get_or_generate_quic_cert();
+        let (cert2, key2) = get_or_generate_quic_cert();
+        if cfg!(feature = "quic-transport") {
+            // With the feature, we get real certs that must be identical.
+            assert_eq!(cert1, cert2, "cert should be cached across calls");
+            assert_eq!(key1, key2, "key should be cached across calls");
+            assert!(!cert1.is_empty(), "cert_der should not be empty");
+            assert!(!key1.is_empty(), "key_der should not be empty");
+        } else {
+            // Without the feature, both should be empty.
+            assert!(cert1.is_empty());
+            assert!(key1.is_empty());
+        }
+    }
+
+    #[test]
+    fn get_quic_cert_der_returns_cert_only() {
+        let cert_der = get_quic_cert_der();
+        let (full_cert, _key) = get_or_generate_quic_cert();
+        assert_eq!(cert_der, full_cert, "get_quic_cert_der should return cert_der from get_or_generate_quic_cert");
+    }
+
+    #[cfg(feature = "quic-transport")]
+    #[test]
+    fn generated_cert_is_valid_der() {
+        let cert_der = get_quic_cert_der();
+        // A valid DER-encoded X.509 cert starts with a SEQUENCE tag (0x30).
+        assert!(!cert_der.is_empty(), "cert should not be empty");
+        assert_eq!(
+            cert_der[0], 0x30,
+            "DER cert should start with SEQUENCE tag (0x30), got 0x{:02x}",
+            cert_der[0]
+        );
+    }
+
+    #[cfg(not(feature = "quic-transport"))]
+    #[test]
+    fn stub_cert_is_empty() {
+        let cert_der = get_quic_cert_der();
+        assert!(cert_der.is_empty(), "stub should return empty cert");
+    }
+
+    #[test]
+    fn get_or_generate_quic_cert_is_thread_safe() {
+        // Verify that concurrent calls don't panic or produce inconsistent results.
+        use std::thread;
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(|| get_or_generate_quic_cert())
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // All results should be identical.
+        for r in &results[1..] {
+            assert_eq!(r.0, results[0].0, "all threads should get the same cert");
+            assert_eq!(r.1, results[0].1, "all threads should get the same key");
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests: QUIC transport (feature-gated)
+// ──────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 #[cfg(feature = "quic-transport")]
 mod tests {
     use super::*;
     use hbb_common::tokio;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_cert_works_with_quic_connect() {
+        // Verify that the cached cert from get_or_generate_quic_cert() can
+        // be used to establish a QUIC connection (loopback test).
+        let (cert_der, key_der) = get_or_generate_quic_cert();
+        assert!(!cert_der.is_empty());
+        assert!(!key_der.is_empty());
+
+        let server =
+            QuicServer::bind("127.0.0.1:0".parse().unwrap(), cert_der.clone(), key_der)
+                .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            server.accept().await.unwrap().unwrap()
+        });
+
+        let client_handle = tokio::spawn({
+            let cert = cert_der.clone();
+            async move { QuicTransport::connect(server_addr, &cert).await.unwrap() }
+        });
+
+        let (server_result, client_result) = tokio::join!(server_handle, client_handle);
+        let server_t = server_result.unwrap();
+        let client_t = client_result.unwrap();
+
+        assert!(server_t.is_connected());
+        assert!(client_t.is_connected());
+
+        // Send a message to verify the connection works.
+        client_t.send_control(b"hello").await.unwrap();
+        let received = server_t.recv_control().await.unwrap();
+        assert_eq!(received, b"hello");
+    }
+
+    #[tokio::test]
+    async fn empty_cert_fails_gracefully() {
+        // An empty certificate should cause QuicTransport::connect to fail,
+        // which triggers TCP fallback in try_quic_connection.
+        let result = QuicTransport::connect(
+            "127.0.0.1:19999".parse().unwrap(),
+            &[],
+        )
+        .await;
+        assert!(result.is_err(), "empty cert should fail");
+    }
 
     /// Helper: spin up a QuicServer and connect a QuicTransport client to it.
     /// Returns `(server_transport, client_transport)`.

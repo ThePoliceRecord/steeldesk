@@ -2020,6 +2020,10 @@ class RustdeskImpl {
     return false;
   }
 
+  String mainGetCursorPrediction({dynamic hint}) {
+    return '{"active":false}';
+  }
+
   bool mainClipCursor(
       {required int left,
       required int top,

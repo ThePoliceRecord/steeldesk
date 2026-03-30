@@ -517,6 +517,7 @@ impl Client {
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        let mut peer_quic_cert: Vec<u8> = Vec::new();
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
@@ -567,6 +568,7 @@ impl Client {
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
+            quic_cert: crate::transport::quic::get_quic_cert_der().into(),
             ..Default::default()
         });
         for i in 1..=3 {
@@ -610,6 +612,7 @@ impl Client {
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
+                            peer_quic_cert = ph.quic_cert.into();
                             let s = udp.0.take();
                             if ph.is_udp && s.is_some() {
                                 if let Some(s) = s {
@@ -722,6 +725,7 @@ impl Client {
                 udp.0,
                 ipv6.0,
                 punch_type,
+                &peer_quic_cert,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -748,6 +752,7 @@ impl Client {
         udp_socket_nat: Option<Arc<UdpSocket>>,
         udp_socket_v6: Option<Arc<UdpSocket>>,
         punch_type: &str,
+        peer_quic_cert: &[u8],
     ) -> ResultType<(
         SessionTransport,
         bool,
@@ -789,6 +794,34 @@ impl Client {
         }
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
+
+        // Attempt QUIC for NAT-traversed peer connections.
+        // The peer's QUIC certificate was exchanged during the rendezvous
+        // handshake (quic_cert field in PunchHoleResponse). If available,
+        // try QUIC first — it provides lower latency via unreliable datagrams.
+        #[cfg(feature = "quic-transport")]
+        {
+            let peer_addr_str = peer.to_string();
+            let quic_result =
+                crate::transport::try_quic_connection(&peer_addr_str, peer_quic_cert).await;
+            if quic_result.attempted {
+                if let Some(session_transport) = quic_result.session_transport {
+                    log::info!(
+                        "QUIC connection to {} succeeded via NAT traversal — using QUIC for session",
+                        peer,
+                    );
+                    return Ok((session_transport, true, None, None, "QUIC"));
+                } else {
+                    log::debug!(
+                        "QUIC attempt to {} skipped/failed: {}",
+                        peer,
+                        quic_result.reason,
+                    );
+                }
+            }
+        }
+        // Suppress unused variable warning when quic-transport is disabled.
+        let _ = peer_quic_cert;
 
         let mut connect_futures = Vec::new();
         let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);

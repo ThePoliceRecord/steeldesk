@@ -188,9 +188,10 @@ pub struct QuicAttemptResult {
 /// or the connection fails, the caller should proceed with TCP.
 ///
 /// `addr` is the target address as a string (e.g., `"1.2.3.4:21117"`).
-/// `peer_pk` is the peer's public key bytes, used as a stand-in for the
-/// server certificate during the QUIC TLS handshake. In production, this
-/// will be replaced by a proper certificate exchange during rendezvous.
+/// `peer_quic_cert` is the peer's DER-encoded self-signed certificate,
+/// exchanged during the rendezvous handshake via the `quic_cert` field in
+/// `PunchHoleResponse` / `PunchHoleSent`. The certificate is used to verify
+/// the peer's QUIC TLS endpoint.
 ///
 /// # Returns
 ///
@@ -198,7 +199,7 @@ pub struct QuicAttemptResult {
 /// it succeeded, and a reason string for logging. On success,
 /// `session_transport` contains a `SessionTransport::Quic` ready for use
 /// in the session loop.
-pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResult {
+pub async fn try_quic_connection(addr: &str, peer_quic_cert: &[u8]) -> QuicAttemptResult {
     if !should_use_quic() {
         return QuicAttemptResult {
             session_transport: None,
@@ -228,22 +229,21 @@ pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResul
         }
     };
 
-    // Attempt QUIC connection.
-    // The peer_pk is used as the server certificate for TLS verification.
-    // TODO: Replace with proper certificate exchange during rendezvous.
-    // For now, if peer_pk is empty, we skip the QUIC attempt since we
-    // cannot verify the server's identity.
-    if peer_pk.is_empty() {
-        hbb_common::log::info!("QUIC: no peer public key available, falling back to TCP");
+    // The peer's QUIC certificate is needed to verify the TLS handshake.
+    // It is exchanged during the rendezvous handshake via the `quic_cert`
+    // field in PunchHoleResponse/PunchHoleSent. If empty, the peer either
+    // does not support QUIC or the cert exchange has not happened yet.
+    if peer_quic_cert.is_empty() {
+        hbb_common::log::info!("QUIC: no peer certificate available, falling back to TCP");
         return QuicAttemptResult {
             session_transport: None,
             quic_transport: None,
             attempted: true,
-            reason: "no peer public key for QUIC TLS".to_string(),
+            reason: "no peer QUIC certificate for TLS verification".to_string(),
         };
     }
 
-    match quic::QuicTransport::connect(socket_addr, peer_pk).await {
+    match quic::QuicTransport::connect(socket_addr, peer_quic_cert).await {
         Ok(transport) => {
             hbb_common::log::info!(
                 "QUIC connection established to {} (transport_type={})",
@@ -567,13 +567,13 @@ mod tests {
     }
 
     #[test]
-    fn try_quic_empty_peer_pk_skips_attempt() {
-        // Even if QUIC were preferred, an empty peer_pk should cause
+    fn try_quic_empty_cert_skips_attempt() {
+        // Even if QUIC were preferred, an empty peer_quic_cert should cause
         // the attempt to be skipped. We cannot test with should_use_quic()
         // returning true without setting config, but we can test the
         // function's behavior via the code path.
         //
-        // This test verifies the contract: empty pk => no QUIC transport.
+        // This test verifies the contract: empty cert => no QUIC transport.
         use hbb_common::tokio;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
