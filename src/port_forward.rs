@@ -12,8 +12,9 @@ use hbb_common::{
     tcp, timeout,
     tokio::{self, net::TcpStream, sync::mpsc},
     tokio_util::codec::{BytesCodec, Framed},
-    ResultType, Stream,
+    ResultType,
 };
+use crate::transport::SessionTransport;
 
 fn run_rdp(port: u16) {
     std::process::Command::new("cmdkey")
@@ -112,7 +113,7 @@ async fn connect_and_login(
     key: &str,
     token: &str,
     is_rdp: bool,
-) -> ResultType<Option<Stream>> {
+) -> ResultType<Option<SessionTransport>> {
     let conn_type = if is_rdp {
         ConnType::RDP
     } else {
@@ -194,7 +195,7 @@ async fn connect_and_login(
     Ok(Some(stream))
 }
 
-async fn run_forward(forward: Framed<TcpStream, BytesCodec>, stream: Stream) -> ResultType<()> {
+async fn run_forward(forward: Framed<TcpStream, BytesCodec>, stream: SessionTransport) -> ResultType<()> {
     log::info!("new port forwarding connection started");
     let mut forward = forward;
     let mut stream = stream;

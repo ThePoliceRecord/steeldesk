@@ -33,10 +33,14 @@
 
 use async_trait::async_trait;
 use hbb_common::ResultType;
+use hbb_common::sodiumoxide;
 
 pub mod fec;
 pub mod quic;
+pub mod quic_stream;
 pub mod tcp;
+
+pub use quic_stream::QuicStream;
 
 /// Unified transport trait for RustDesk peer connections.
 ///
@@ -160,33 +164,17 @@ pub fn should_use_quic() -> bool {
 
 /// Result of a QUIC connection attempt.
 ///
-/// When QUIC is preferred and succeeds, `quic_transport` holds the live
-/// connection. The caller must still fall through to TCP when this is `None`
-/// (either because QUIC is not preferred, or because the attempt failed).
-///
-/// # Full Integration TODO
-///
-/// Currently, the RustDesk session layer operates on `hbb_common::Stream`
-/// (an enum of TCP / WebSocket). To use QUIC end-to-end, the following
-/// changes are needed:
-///
-/// 1. Add a `Stream::Quic(QuicStream)` variant to `hbb_common::Stream`,
-///    where `QuicStream` wraps a QUIC bidirectional stream and implements
-///    the same `send`/`next`/`send_bytes` interface.
-/// 2. Adapt `secure_connection()` in `client.rs` to work over the
-///    `Transport` trait (QUIC already has TLS 1.3 built in, so the
-///    NaCl-based key exchange can be skipped or replaced).
-/// 3. Plumb the `Transport` trait object through the session rather than
-///    the raw `Stream`.
-///
-/// Until then, the QUIC transport is connected but not used for the
-/// session data path — the connection falls back to TCP for the actual
-/// session, and the QUIC connection is dropped. This is intentional:
-/// it validates that QUIC handshakes succeed in real network conditions
-/// before we invest in the full session refactor.
+/// When QUIC is preferred and succeeds, `session_transport` holds a
+/// `SessionTransport::Quic` ready for use in the session loop. The caller
+/// must still fall through to TCP when this is `None` (either because QUIC
+/// is not preferred, or because the attempt failed).
 pub struct QuicAttemptResult {
-    /// The live QUIC transport, if connection succeeded.
-    /// `None` means QUIC was not attempted or failed (fall back to TCP).
+    /// A `SessionTransport::Quic` wrapping the live QUIC connection, if
+    /// connection succeeded. `None` means QUIC was not attempted or failed
+    /// (fall back to TCP).
+    pub session_transport: Option<SessionTransport>,
+    /// The raw QUIC transport, if connection succeeded (kept for backward
+    /// compat with code that inspects the transport directly).
     pub quic_transport: Option<quic::QuicTransport>,
     /// Whether QUIC was attempted at all.
     pub attempted: bool,
@@ -207,10 +195,13 @@ pub struct QuicAttemptResult {
 /// # Returns
 ///
 /// A `QuicAttemptResult` indicating whether QUIC was attempted, whether
-/// it succeeded, and a reason string for logging.
+/// it succeeded, and a reason string for logging. On success,
+/// `session_transport` contains a `SessionTransport::Quic` ready for use
+/// in the session loop.
 pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResult {
     if !should_use_quic() {
         return QuicAttemptResult {
+            session_transport: None,
             quic_transport: None,
             attempted: false,
             reason: if cfg!(feature = "quic-transport") {
@@ -229,6 +220,7 @@ pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResul
         Err(e) => {
             hbb_common::log::warn!("QUIC: cannot parse address '{}': {}, falling back to TCP", addr, e);
             return QuicAttemptResult {
+                session_transport: None,
                 quic_transport: None,
                 attempted: true,
                 reason: format!("address parse error: {}", e),
@@ -244,6 +236,7 @@ pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResul
     if peer_pk.is_empty() {
         hbb_common::log::info!("QUIC: no peer public key available, falling back to TCP");
         return QuicAttemptResult {
+            session_transport: None,
             quic_transport: None,
             attempted: true,
             reason: "no peer public key for QUIC TLS".to_string(),
@@ -257,11 +250,13 @@ pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResul
                 addr,
                 transport.transport_type(),
             );
-            // TODO: Once Stream::Quic variant exists, return the transport
-            // for use in the session. For now, we log success but the caller
-            // will still use TCP for the actual session data path.
+            // Wrap the QUIC transport in a QuicStream, then in a
+            // SessionTransport for use in the session loop.
+            let quic_stream = QuicStream::new(transport);
+            let session = SessionTransport::Quic(quic_stream);
             QuicAttemptResult {
-                quic_transport: Some(transport),
+                session_transport: Some(session),
+                quic_transport: None, // ownership moved to SessionTransport
                 attempted: true,
                 reason: "QUIC connected successfully".to_string(),
             }
@@ -269,11 +264,181 @@ pub async fn try_quic_connection(addr: &str, peer_pk: &[u8]) -> QuicAttemptResul
         Err(e) => {
             hbb_common::log::warn!("QUIC connection to {} failed: {}, falling back to TCP", addr, e);
             QuicAttemptResult {
+                session_transport: None,
                 quic_transport: None,
                 attempted: true,
                 reason: format!("QUIC connect error: {}", e),
             }
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// SessionTransport — unified enum for session-level connections
+// ──────────────────────────────────────────────────────────────────────
+
+/// A unified transport for session-level connections.
+///
+/// Wraps either an `hbb_common::Stream` (TCP/WebSocket) or a `QuicStream`
+/// (QUIC), forwarding all session-level operations to the underlying
+/// transport. This allows the session loop in `client.rs` to be
+/// transport-agnostic: the same `send()`, `next()`, `set_key()` etc.
+/// calls work regardless of whether the connection is TCP or QUIC.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Direct IP path in client.rs:
+/// let transport = if quic_succeeded {
+///     SessionTransport::Quic(QuicStream::new(quic_transport))
+/// } else {
+///     SessionTransport::Tcp(connect_tcp_local(...).await?)
+/// };
+/// // Then use transport.send(), transport.next(), etc.
+/// ```
+///
+/// # Encryption
+///
+/// For the TCP variant, `set_key()` enables NaCl encryption as usual.
+/// For the QUIC variant, `set_key()` is a no-op because QUIC has TLS 1.3
+/// built in. `is_secured()` always returns `true` for QUIC.
+pub enum SessionTransport {
+    /// TCP (or WebSocket) transport via `hbb_common::Stream`.
+    Tcp(hbb_common::Stream),
+    /// QUIC transport via `QuicStream`.
+    Quic(QuicStream),
+}
+
+impl SessionTransport {
+    /// Send a protobuf message.
+    #[inline]
+    pub async fn send(&mut self, msg: &impl hbb_common::protobuf::Message) -> hbb_common::ResultType<()> {
+        match self {
+            SessionTransport::Tcp(s) => s.send(msg).await,
+            SessionTransport::Quic(q) => q.send(msg).await,
+        }
+    }
+
+    /// Receive the next message as raw bytes.
+    #[inline]
+    pub async fn next(&mut self) -> Option<Result<bytes::BytesMut, std::io::Error>> {
+        match self {
+            SessionTransport::Tcp(s) => s.next().await,
+            SessionTransport::Quic(q) => q.next().await,
+        }
+    }
+
+    /// Receive the next message with a timeout.
+    #[inline]
+    pub async fn next_timeout(
+        &mut self,
+        timeout: u64,
+    ) -> Option<Result<bytes::BytesMut, std::io::Error>> {
+        match self {
+            SessionTransport::Tcp(s) => s.next_timeout(timeout).await,
+            SessionTransport::Quic(q) => q.next_timeout(timeout).await,
+        }
+    }
+
+    /// Send raw bytes.
+    #[inline]
+    pub async fn send_raw(&mut self, bytes: Vec<u8>) -> hbb_common::ResultType<()> {
+        match self {
+            SessionTransport::Tcp(s) => s.send_raw(bytes).await,
+            SessionTransport::Quic(q) => q.send_raw(bytes).await,
+        }
+    }
+
+    /// Send pre-formed bytes.
+    #[inline]
+    pub async fn send_bytes(&mut self, bytes: bytes::Bytes) -> hbb_common::ResultType<()> {
+        match self {
+            SessionTransport::Tcp(s) => s.send_bytes(bytes).await,
+            SessionTransport::Quic(q) => q.send_bytes(bytes).await,
+        }
+    }
+
+    /// Set the encryption key. No-op for QUIC (TLS 1.3 built in).
+    #[inline]
+    pub fn set_key(&mut self, key: sodiumoxide::crypto::secretbox::Key) {
+        match self {
+            SessionTransport::Tcp(s) => s.set_key(key),
+            SessionTransport::Quic(q) => q.set_key(key),
+        }
+    }
+
+    /// Set raw mode. No-op for QUIC.
+    #[inline]
+    pub fn set_raw(&mut self) {
+        match self {
+            SessionTransport::Tcp(s) => s.set_raw(),
+            SessionTransport::Quic(q) => q.set_raw(),
+        }
+    }
+
+    /// Set the send timeout in milliseconds.
+    #[inline]
+    pub fn set_send_timeout(&mut self, ms: u64) {
+        match self {
+            SessionTransport::Tcp(s) => s.set_send_timeout(ms),
+            SessionTransport::Quic(q) => q.set_send_timeout(ms),
+        }
+    }
+
+    /// Returns `true` if the connection is encrypted.
+    /// Always `true` for QUIC; depends on key exchange for TCP.
+    #[inline]
+    pub fn is_secured(&self) -> bool {
+        match self {
+            SessionTransport::Tcp(s) => s.is_secured(),
+            SessionTransport::Quic(q) => q.is_secured(),
+        }
+    }
+
+    /// Returns the local socket address.
+    #[inline]
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        match self {
+            SessionTransport::Tcp(s) => s.local_addr(),
+            SessionTransport::Quic(q) => q.local_addr(),
+        }
+    }
+
+    /// Returns the transport type name for logging.
+    pub fn transport_type_str(&self) -> &'static str {
+        match self {
+            SessionTransport::Tcp(_) => "TCP",
+            SessionTransport::Quic(_) => "QUIC",
+        }
+    }
+
+    /// Returns a mutable reference to the inner `hbb_common::Stream`, if
+    /// this is a TCP transport.
+    ///
+    /// This is a backward-compatibility escape hatch for `hbb_common` APIs
+    /// (like `fs::handle_read_jobs`) that take `&mut Stream` directly.
+    /// QUIC connections do not have an inner `Stream`, so this returns `None`.
+    ///
+    /// Callers should prefer using `SessionTransport` methods directly
+    /// rather than reaching into the inner `Stream`.
+    #[inline]
+    pub fn as_stream_mut(&mut self) -> Option<&mut hbb_common::Stream> {
+        match self {
+            SessionTransport::Tcp(s) => Some(s),
+            SessionTransport::Quic(_) => None,
+        }
+    }
+}
+
+impl From<hbb_common::Stream> for SessionTransport {
+    fn from(stream: hbb_common::Stream) -> Self {
+        SessionTransport::Tcp(stream)
+    }
+}
+
+impl From<QuicStream> for SessionTransport {
+    fn from(qs: QuicStream) -> Self {
+        SessionTransport::Quic(qs)
     }
 }
 
@@ -395,6 +560,7 @@ mod tests {
             // should_use_quic() returns false (no config option set, and
             // possibly no feature), so attempted should be false.
             assert!(!result.attempted);
+            assert!(result.session_transport.is_none());
             assert!(result.quic_transport.is_none());
             assert!(!result.reason.is_empty());
         });
@@ -412,6 +578,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let result = try_quic_connection("127.0.0.1:21117", &[]).await;
+            assert!(result.session_transport.is_none());
             assert!(result.quic_transport.is_none());
         });
     }
@@ -420,11 +587,13 @@ mod tests {
     fn quic_attempt_result_defaults() {
         // Verify QuicAttemptResult can be constructed and fields are accessible.
         let result = QuicAttemptResult {
+            session_transport: None,
             quic_transport: None,
             attempted: false,
             reason: "test".to_string(),
         };
         assert!(!result.attempted);
+        assert!(result.session_transport.is_none());
         assert!(result.quic_transport.is_none());
         assert_eq!(result.reason, "test");
     }
@@ -455,6 +624,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let result = try_quic_connection("not-an-address", &[0u8; 32]).await;
+            assert!(result.session_transport.is_none());
             assert!(result.quic_transport.is_none());
         });
     }
@@ -472,6 +642,7 @@ mod tests {
             let result = try_quic_connection("127.0.0.1:19999", &[0u8; 32]).await;
             // should_use_quic() is false because config is not set
             assert!(!result.attempted);
+            assert!(result.session_transport.is_none());
             assert!(result.quic_transport.is_none());
             assert!(
                 result.reason.contains("not preferred"),
@@ -479,5 +650,128 @@ mod tests {
                 result.reason,
             );
         });
+    }
+
+    // ── SessionTransport tests ──────────────────────────────────────────
+
+    #[test]
+    fn session_transport_tcp_dispatches_correctly() {
+        // Verify that SessionTransport::Tcp forwards is_secured() to Stream.
+        use hbb_common::tokio;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let client_handle = tokio::spawn(async move {
+                tokio::net::TcpStream::connect(addr).await.unwrap()
+            });
+            let (server_stream, _) = listener.accept().await.unwrap();
+            let client_stream = client_handle.await.unwrap();
+
+            let stream = hbb_common::Stream::from(client_stream, addr);
+            let transport = SessionTransport::Tcp(stream);
+
+            assert_eq!(transport.transport_type_str(), "TCP");
+            assert!(!transport.is_secured()); // No key set yet
+            assert_eq!(transport.local_addr(), addr);
+
+            // Verify the server side also works
+            let _server_stream = server_stream; // keep alive
+        });
+    }
+
+    #[test]
+    fn session_transport_from_stream() {
+        // Verify From<Stream> for SessionTransport works.
+        use hbb_common::tokio;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client_handle = tokio::spawn(async move {
+                tokio::net::TcpStream::connect(addr).await.unwrap()
+            });
+            let (_server, _) = listener.accept().await.unwrap();
+            let client = client_handle.await.unwrap();
+
+            let stream = hbb_common::Stream::from(client, addr);
+            let transport: SessionTransport = stream.into();
+            assert_eq!(transport.transport_type_str(), "TCP");
+        });
+    }
+
+    #[test]
+    fn session_transport_tcp_send_recv() {
+        // Verify that SessionTransport::Tcp can send and receive messages.
+        use hbb_common::message_proto::Message;
+        use hbb_common::tokio;
+        use hbb_common::protobuf::Message as _;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let client_handle = tokio::spawn(async move {
+                tokio::net::TcpStream::connect(addr).await.unwrap()
+            });
+            let (server_tcp, server_addr) = listener.accept().await.unwrap();
+            let client_tcp = client_handle.await.unwrap();
+
+            let mut client_transport =
+                SessionTransport::Tcp(hbb_common::Stream::from(client_tcp, addr));
+            let mut server_transport =
+                SessionTransport::Tcp(hbb_common::Stream::from(server_tcp, server_addr));
+
+            // Send a protobuf message from client to server.
+            let msg = Message::new();
+            client_transport.send(&msg).await.unwrap();
+
+            let received = server_transport.next().await.unwrap().unwrap();
+            let parsed = Message::parse_from_bytes(&received).unwrap();
+            assert_eq!(parsed, msg);
+        });
+    }
+
+    #[test]
+    fn session_transport_set_key_tcp() {
+        // Verify set_key works on TCP variant.
+        use hbb_common::tokio;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client_handle = tokio::spawn(async move {
+                tokio::net::TcpStream::connect(addr).await.unwrap()
+            });
+            let (_server, _) = listener.accept().await.unwrap();
+            let client = client_handle.await.unwrap();
+
+            let mut transport =
+                SessionTransport::Tcp(hbb_common::Stream::from(client, addr));
+
+            assert!(!transport.is_secured());
+            let key = sodiumoxide::crypto::secretbox::gen_key();
+            transport.set_key(key);
+            assert!(transport.is_secured());
+        });
+    }
+
+    /// Verify that SessionTransport::Quic wraps QuicStream correctly
+    /// (compile-time check — ensures the enum variant and methods exist).
+    #[test]
+    fn session_transport_quic_variant_compiles() {
+        fn _assert_quic_methods(t: &SessionTransport) {
+            let _ = t.is_secured();
+            let _ = t.transport_type_str();
+            let _ = t.local_addr();
+        }
+
+        fn _assert_quic_async_methods(t: &mut SessionTransport) {
+            // These are async, just verify they exist.
+            let _ = &t.next();
+        }
     }
 }

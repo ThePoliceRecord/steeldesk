@@ -23,7 +23,7 @@ use hbb_common::{
         sync::mpsc,
         time::{Duration as TokioDuration, Instant},
     },
-    whoami, Stream,
+    whoami,
 };
 use rdev::{Event, EventType::*, KeyCode};
 #[cfg(all(feature = "vram", feature = "flutter"))]
@@ -41,6 +41,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::client::io_loop::Remote;
+use crate::transport::SessionTransport;
 use crate::client::{
     check_if_retry, handle_hash, handle_login_error, handle_login_from_ui, handle_test_delay,
     input_os_password, send_mouse, send_pointer_device_event, FileManager, Key, LoginConfigHandler,
@@ -1854,7 +1855,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         }
     }
 
-    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) {
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut SessionTransport) {
         handle_hash(self.lc.clone(), pass, hash, self, peer).await;
     }
 
@@ -1864,7 +1865,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         os_password: String,
         password: String,
         remember: bool,
-        peer: &mut Stream,
+        peer: &mut SessionTransport,
     ) {
         handle_login_from_ui(
             self.lc.clone(),
@@ -1877,7 +1878,7 @@ impl<T: InvokeUiSession> Interface for Session<T> {
         .await;
     }
 
-    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut SessionTransport) {
         if !t.from_client {
             self.update_quality_status(QualityStatus {
                 delay: Some(t.last_delay as _),

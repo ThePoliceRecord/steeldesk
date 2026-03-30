@@ -74,6 +74,7 @@ use hbb_common::{
     },
     AddrMangle, ResultType, Stream,
 };
+use crate::transport::SessionTransport;
 pub use helper::*;
 use scrap::{
     codec::Decoder,
@@ -229,6 +230,10 @@ impl Client {
     const CLIENT_CLIPBOARD_NAME: &'static str = "client-clipboard";
 
     /// Start a new connection.
+    ///
+    /// Returns `((SessionTransport, direct, pk, kcp, stream_type), (feedback, rendezvous_server))`.
+    /// The `SessionTransport` wraps either a TCP `Stream` or a QUIC `QuicStream`,
+    /// providing the same `send()`/`next()`/`set_key()` interface regardless.
     pub async fn start(
         peer: &str,
         key: &str,
@@ -237,7 +242,7 @@ impl Client {
         interface: impl Interface,
     ) -> ResultType<(
         (
-            Stream,
+            SessionTransport,
             bool,
             Option<Vec<u8>>,
             Option<KcpStream>,
@@ -282,7 +287,7 @@ impl Client {
         interface: impl Interface,
     ) -> ResultType<(
         (
-            Stream,
+            SessionTransport,
             bool,
             Option<Vec<u8>>,
             Option<KcpStream>,
@@ -328,23 +333,30 @@ impl Client {
             {
                 let quic_result = crate::transport::try_quic_connection(&addr, &[]).await;
                 if quic_result.attempted {
-                    if quic_result.quic_transport.is_some() {
+                    if let Some(session_transport) = quic_result.session_transport {
                         log::info!(
-                            "QUIC probe to {} succeeded — session will use TCP until \
-                             Stream::Quic is implemented",
+                            "QUIC connection to {} succeeded — using QUIC for session",
                             addr,
                         );
-                        // TODO: Use the QUIC transport for the session once
-                        // Stream::Quic variant exists. For now, drop it and
-                        // fall through to TCP.
+                        return Ok((
+                            (
+                                session_transport,
+                                true,
+                                None,
+                                None,
+                                "QUIC",
+                            ),
+                            (0, "".to_owned()),
+                            false,
+                        ));
                     } else {
-                        log::debug!("QUIC probe to {} skipped/failed: {}", addr, quic_result.reason);
+                        log::debug!("QUIC probe to {} skipped/failed: {}, falling back to TCP", addr, quic_result.reason);
                     }
                 }
             }
             return Ok((
                 (
-                    connect_tcp_local(addr, None, CONNECT_TIMEOUT).await?,
+                    SessionTransport::Tcp(connect_tcp_local(addr, None, CONNECT_TIMEOUT).await?),
                     true,
                     None,
                     None,
@@ -356,26 +368,11 @@ impl Client {
         }
         // Allow connect to {domain}:{port}
         if hbb_common::is_domain_port_str(peer) {
-            // Attempt QUIC for direct domain connections.
-            // Same limitation as direct IP: no peer certificate available yet.
-            #[cfg(feature = "quic-transport")]
-            {
-                let quic_result = crate::transport::try_quic_connection(peer, &[]).await;
-                if quic_result.attempted {
-                    if quic_result.quic_transport.is_some() {
-                        log::info!(
-                            "QUIC probe to {} succeeded — session will use TCP until \
-                             Stream::Quic is implemented",
-                            peer,
-                        );
-                    } else {
-                        log::debug!("QUIC probe to {} skipped/failed: {}", peer, quic_result.reason);
-                    }
-                }
-            }
+            // Domain path still uses TCP only — QUIC requires certificate
+            // exchange which is not available for domain connections yet.
             return Ok((
                 (
-                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,
+                    SessionTransport::Tcp(connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?),
                     true,
                     None,
                     None,
@@ -482,7 +479,7 @@ impl Client {
         contained: bool,
     ) -> ResultType<(
         (
-            Stream,
+            SessionTransport,
             bool,
             Option<Vec<u8>>,
             Option<KcpStream>,
@@ -673,7 +670,7 @@ impl Client {
 
                             Err(e) => (Err(e), None, ""),
                         };
-                        let mut conn = conn?;
+                        let mut conn: SessionTransport = SessionTransport::Tcp(conn?);
                         feedback = rr.feedback;
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
@@ -752,7 +749,7 @@ impl Client {
         udp_socket_v6: Option<Arc<UdpSocket>>,
         punch_type: &str,
     ) -> ResultType<(
-        Stream,
+        SessionTransport,
         bool,
         Option<Vec<u8>>,
         Option<KcpStream>,
@@ -838,7 +835,7 @@ impl Client {
                 bail!("Failed to make direct connection to remote desktop");
             }
         }
-        let mut conn = conn?;
+        let mut conn: SessionTransport = SessionTransport::Tcp(conn?);
         log::info!(
             "{:?} used to establish {typ} connection with {} punch",
             start.elapsed(),
@@ -858,11 +855,15 @@ impl Client {
     }
 
     /// Establish secure connection with the server.
+    ///
+    /// For QUIC connections, TLS 1.3 is already built in, so `set_key()` is
+    /// a no-op. The NaCl key exchange still runs for protocol compatibility
+    /// with the remote peer (which expects the handshake messages).
     async fn secure_connection(
         peer_id: &str,
         signed_id_pk: Vec<u8>,
         key: &str,
-        conn: &mut Stream,
+        conn: &mut SessionTransport,
     ) -> ResultType<Option<Vec<u8>>> {
         let rs_pk = get_rs_pk(if key.is_empty() {
             config::RS_PUB_KEY
@@ -1031,19 +1032,20 @@ impl Client {
         // rendezvous handshake. For now, we pass an empty cert which causes
         // try_quic_connection to skip the attempt gracefully.
         // TODO: Obtain relay server certificate from rendezvous response.
+        // Once a cert is available, return SessionTransport::Quic here.
         #[cfg(feature = "quic-transport")]
         {
             let quic_result = crate::transport::try_quic_connection(&relay_addr, &[]).await;
             if quic_result.attempted {
-                if quic_result.quic_transport.is_some() {
+                if quic_result.session_transport.is_some() {
                     log::info!(
-                        "QUIC probe to relay {} succeeded — session will use TCP until \
-                         Stream::Quic is implemented",
+                        "QUIC probe to relay {} succeeded — relay path does not yet \
+                         use QUIC (no relay cert exchange)",
                         relay_addr,
                     );
-                    // TODO: Use the QUIC transport for the relay session once
-                    // Stream::Quic variant exists. For now, drop it and
-                    // fall through to TCP.
+                    // TODO: Use the QUIC SessionTransport for the relay session
+                    // once relay cert exchange is implemented. For now, drop it
+                    // and fall through to TCP.
                 } else {
                     log::debug!(
                         "QUIC probe to relay {} skipped/failed: {}",
@@ -3212,7 +3214,7 @@ async fn do_sync_cpu_usage() {
 ///
 /// * `t` - The latency test message.
 /// * `peer` - The peer.
-pub async fn handle_test_delay(t: TestDelay, peer: &mut Stream) {
+pub async fn handle_test_delay(t: TestDelay, peer: &mut SessionTransport) {
     if !t.from_client {
         let mut msg_out = Message::new();
         msg_out.set_test_delay(t);
@@ -3540,7 +3542,7 @@ pub async fn handle_hash(
     password_preset: &str,
     hash: Hash,
     interface: &impl Interface,
-    peer: &mut Stream,
+    peer: &mut SessionTransport,
 ) {
     lc.write().unwrap().hash = hash.clone();
     // Take care of password application order
@@ -3682,7 +3684,7 @@ async fn send_login(
     os_username: String,
     os_password: String,
     password: Vec<u8>,
-    peer: &mut Stream,
+    peer: &mut SessionTransport,
 ) {
     let msg_out = lc
         .read()
@@ -3707,7 +3709,7 @@ pub async fn handle_login_from_ui(
     os_password: String,
     password: String,
     remember: bool,
-    peer: &mut Stream,
+    peer: &mut SessionTransport,
 ) {
     let mut hash_password = if password.is_empty() {
         let mut password2 = lc.read().unwrap().password.clone();
@@ -3738,7 +3740,7 @@ pub async fn handle_login_from_ui(
 
 async fn send_switch_login_request(
     lc: Arc<RwLock<LoginConfigHandler>>,
-    peer: &mut Stream,
+    peer: &mut SessionTransport,
     uuid: Uuid,
 ) {
     let mut msg_out = Message::new();
@@ -3768,16 +3770,16 @@ pub trait Interface: Send + Clone + 'static + Sized {
     fn on_error(&self, err: &str) {
         self.msgbox("error", "Error", err, "");
     }
-    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream);
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut SessionTransport);
     async fn handle_login_from_ui(
         &self,
         os_username: String,
         os_password: String,
         password: String,
         remember: bool,
-        peer: &mut Stream,
+        peer: &mut SessionTransport,
     );
-    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream);
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut SessionTransport);
 
     fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>>;
 

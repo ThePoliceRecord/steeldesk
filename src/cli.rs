@@ -1,4 +1,5 @@
 use crate::client::*;
+use crate::transport::SessionTransport;
 use async_trait::async_trait;
 use hbb_common::{
     config::PeerConfig,
@@ -87,7 +88,7 @@ impl Interface for Session {
         self.lc.write().unwrap().handle_peer_info(&pi);
     }
 
-    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) {
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut SessionTransport) {
         log::info!(
             "password={}",
             hbb_common::password_security::temporary_password()
@@ -101,7 +102,7 @@ impl Interface for Session {
         os_password: String,
         password: String,
         remember: bool,
-        peer: &mut Stream,
+        peer: &mut SessionTransport,
     ) {
         handle_login_from_ui(
             self.lc.clone(),
@@ -114,7 +115,7 @@ impl Interface for Session {
         .await;
     }
 
-    async fn handle_test_delay(&self, t: TestDelay, peer: &mut Stream) {
+    async fn handle_test_delay(&self, t: TestDelay, peer: &mut SessionTransport) {
         handle_test_delay(t, peer).await;
     }
 

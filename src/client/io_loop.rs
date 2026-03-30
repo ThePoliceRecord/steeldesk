@@ -37,8 +37,8 @@ use hbb_common::{
         sync::mpsc,
         time::{self, Duration, Instant},
     },
-    Stream,
 };
+use crate::transport::SessionTransport;
 #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
 use hbb_common::{tokio::sync::Mutex as TokioMutex, ResultType};
 use scrap::CodecFormat;
@@ -269,7 +269,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                 break;
                             }
                             if !self.read_jobs.is_empty() {
-                                if let Err(err) = fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await {
+                                // handle_read_jobs requires &mut Stream; extract it from
+                                // SessionTransport. File transfers over QUIC are not yet
+                                // supported, so this unwrap is safe for all current paths.
+                                let stream_ref = peer.as_stream_mut()
+                                    .expect("file transfer requires TCP transport (QUIC file transfer not yet supported)");
+                                if let Err(err) = fs::handle_read_jobs(&mut self.read_jobs, stream_ref).await {
                                     self.handler.msgbox("error", "Connection Error", &err.to_string(), "");
                                     break;
                                 }
@@ -357,7 +362,7 @@ impl<T: InvokeUiSession> Remote<T> {
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     async fn handle_local_clipboard_msg(
         &self,
-        peer: &mut Stream,
+        peer: &mut SessionTransport,
         msg: Option<clipboard::ClipboardFile>,
     ) {
         match msg {
@@ -521,7 +526,7 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
-    async fn send_close_reason(&mut self, peer: &mut Stream, reason: &str) {
+    async fn send_close_reason(&mut self, peer: &mut SessionTransport, reason: &str) {
         if self.sent_close_reason {
             return;
         }
@@ -533,7 +538,7 @@ impl<T: InvokeUiSession> Remote<T> {
         self.sent_close_reason = true;
     }
 
-    async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
+    async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut SessionTransport) -> bool {
         match data {
             Data::Close => {
                 self.send_close_reason(peer, "").await;
@@ -1075,7 +1080,7 @@ impl<T: InvokeUiSession> Remote<T> {
         true
     }
 
-    async fn send_toggle_virtual_display_msg(&self, peer: &mut Stream) {
+    async fn send_toggle_virtual_display_msg(&self, peer: &mut SessionTransport) {
         if !self.peer_info.is_support_virtual_display() {
             return;
         }
@@ -1096,7 +1101,7 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
-    async fn send_toggle_privacy_mode_msg(&self, peer: &mut Stream) {
+    async fn send_toggle_privacy_mode_msg(&self, peer: &mut SessionTransport) {
         let lc = self.handler.lc.read().unwrap();
         if lc.version >= hbb_common::get_version_number("1.2.4")
             && lc.get_toggle_option("privacy-mode")
@@ -1280,7 +1285,7 @@ impl<T: InvokeUiSession> Remote<T> {
         return false;
     }
 
-    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
+    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut SessionTransport) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
@@ -2246,7 +2251,7 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_cliprdr_msg(
         &mut self,
         clip: hbb_common::message_proto::Cliprdr,
-        _peer: &mut Stream,
+        _peer: &mut SessionTransport,
     ) {
         log::debug!("handling cliprdr msg from server peer");
         #[cfg(feature = "flutter")]
