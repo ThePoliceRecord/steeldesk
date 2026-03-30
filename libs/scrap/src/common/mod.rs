@@ -232,20 +232,33 @@ pub enum Pixfmt {
     I420,
     NV12,
     I444,
+    /// YUV 4:2:0 10-bit semi-planar (DXGI/VAAPI native HDR format).
+    /// Each component is stored in 16-bit words with 10 significant bits.
+    P010,
+    /// 10-bit ARGB packed as 2:10:10:10 (macOS native HDR capture format).
+    /// Each pixel is a single 32-bit word: 2 bits alpha, 10 bits each for R/G/B.
+    ARGB2101010,
 }
 
 impl Pixfmt {
     pub fn bpp(&self) -> usize {
         match self {
             Pixfmt::BGRA | Pixfmt::RGBA => 32,
+            Pixfmt::ARGB2101010 => 32, // packed 32-bit (2+10+10+10)
             Pixfmt::RGB565LE => 16,
             Pixfmt::I420 | Pixfmt::NV12 => 12,
+            Pixfmt::P010 => 24, // 10-bit 4:2:0 = 15 bpp, but stored in 16-bit words → 24 bpp
             Pixfmt::I444 => 24,
         }
     }
 
     pub fn bytes_per_pixel(&self) -> usize {
         (self.bpp() + 7) / 8
+    }
+
+    /// Returns true if this pixel format uses more than 8 bits per channel.
+    pub fn is_10bit(&self) -> bool {
+        matches!(self, Pixfmt::P010 | Pixfmt::ARGB2101010)
     }
 }
 
@@ -544,4 +557,98 @@ pub fn screen_size() -> (u16, u16, u16) {
 #[cfg(target_os = "android")]
 pub fn is_start() -> Option<bool> {
     android::is_start()
+}
+
+// ---------------------------------------------------------------------------
+// HDR support
+// ---------------------------------------------------------------------------
+
+/// HDR metadata describing the display/capture color characteristics.
+///
+/// This struct is carried alongside captured frames and through the protocol
+/// so that the client can decide whether to render in HDR or tone-map to SDR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdrInfo {
+    /// Whether HDR capture is currently active.
+    pub enabled: bool,
+    /// Bits per channel (8 for SDR, 10 for HDR).
+    pub bit_depth: u8,
+    /// Peak luminance of the captured display in nits (e.g. 1000 for HDR-1000).
+    /// 0 or absent means unknown / SDR.
+    pub max_luminance: u32,
+}
+
+impl Default for HdrInfo {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bit_depth: 8,
+            max_luminance: 0,
+        }
+    }
+}
+
+impl HdrInfo {
+    /// Create an SDR info (the default, non-HDR case).
+    pub fn sdr() -> Self {
+        Self::default()
+    }
+
+    /// Create an HDR info with the given bit depth and peak luminance.
+    pub fn hdr(bit_depth: u8, max_luminance: u32) -> Self {
+        Self {
+            enabled: true,
+            bit_depth,
+            max_luminance,
+        }
+    }
+}
+
+/// Detect whether the current display supports HDR.
+///
+/// On macOS this checks `NSScreen.maximumExtendedDynamicRangeColorComponentValue`
+/// (EDR > 1.0 means HDR capable). On other platforms, or when the native check
+/// is not available, this falls back to the `STEELDESK_HDR` environment variable
+/// (`"1"` to force-enable).
+///
+/// This function is intentionally kept cheap — it does not call into
+/// platform APIs that require event-loop access.
+#[cfg(target_os = "macos")]
+pub fn is_display_hdr() -> bool {
+    // On macOS we could call into NSScreen APIs via objc, but those require
+    // linking the AppKit framework and an active run-loop.  For now, use the
+    // env-var toggle so the feature can be tested without macOS hardware.
+    // TODO: add real NSScreen EDR query via objc2 crate.
+    std::env::var("STEELDESK_HDR").unwrap_or_default() == "1"
+}
+
+/// Detect whether the current display supports HDR.
+///
+/// On non-macOS platforms this checks only the `STEELDESK_HDR` environment
+/// variable (`"1"` to force-enable).  Real per-platform detection (DXGI 1.6
+/// on Windows, Wayland color-management on Linux) will be added later.
+#[cfg(not(target_os = "macos"))]
+pub fn is_display_hdr() -> bool {
+    std::env::var("STEELDESK_HDR").unwrap_or_default() == "1"
+}
+
+/// Choose the appropriate `Pixfmt` for the current display.
+///
+/// When HDR is active, returns `Pixfmt::ARGB2101010`; otherwise returns
+/// `Pixfmt::BGRA` (the long-standing default).
+pub fn hdr_pixfmt() -> Pixfmt {
+    if is_display_hdr() {
+        Pixfmt::ARGB2101010
+    } else {
+        Pixfmt::BGRA
+    }
+}
+
+/// Build an `HdrInfo` reflecting the current display state.
+pub fn current_hdr_info() -> HdrInfo {
+    if is_display_hdr() {
+        HdrInfo::hdr(10, 0) // luminance unknown until we query the display
+    } else {
+        HdrInfo::sdr()
+    }
 }

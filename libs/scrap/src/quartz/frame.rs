@@ -50,6 +50,26 @@ impl Frame {
             );
         }
     }
+
+    /// Convert an ARGB2101010 (10-bit HDR) surface to 8-bit BGRA.
+    ///
+    /// The surface data is in packed ARGB 2:10:10:10 format (`'l10r'`).
+    /// We copy it out, then convert in-place to BGRA using the
+    /// `argb2101010_to_bgra` helper (right-shift 10→8 per channel).
+    pub fn surface_to_bgra_from_2101010<'a>(&'a mut self, h: usize) {
+        unsafe {
+            let plane0 = IOSurfaceGetBaseAddressOfPlane(self.surface, 0);
+            let surface_stride = IOSurfaceGetBytesPerRowOfPlane(self.surface, 0);
+            let src_len = surface_stride * h;
+            // Read raw 10-bit data from the surface.
+            let mut raw_2101010 = vec![0u8; src_len];
+            std::ptr::copy_nonoverlapping(plane0 as _, raw_2101010.as_mut_ptr(), src_len);
+            // Convert to BGRA.
+            crate::argb2101010_to_bgra(&raw_2101010, &mut self.bgra);
+            // Stride stays the same — both formats are 4 bytes per pixel.
+            self.bgra_stride = surface_stride;
+        }
+    }
 }
 
 impl ops::Deref for Frame {

@@ -198,6 +198,58 @@ pub fn convert_to_yuv(
     Ok(())
 }
 
+/// Convert ARGB 2:10:10:10 pixel data to 8-bit BGRA.
+///
+/// Each source pixel is a packed 32-bit value laid out (from MSB to LSB) as:
+///
+///   `[AA RRRRRRRRRR GGGGGGGGGG BBBBBBBBBB]`
+///
+/// i.e. 2 bits alpha, then 10 bits each for R, G, B.  The 10-bit channels are
+/// down-shifted to 8-bit (keeping the top 8 of 10 bits).  Alpha is expanded
+/// from 2-bit (0..3) to 8-bit (0..255).
+///
+/// This is the tone-mapping fallback path: when the remote captures in HDR
+/// (`ARGB2101010`) but the client can only display SDR (`BGRA`), we lose
+/// dynamic range but keep the spatial image.
+///
+/// `src` and `dst` are both densely-packed pixel arrays (stride == width * 4).
+/// `dst` will be resized to match `src` length.
+pub fn argb2101010_to_bgra(src: &[u8], dst: &mut Vec<u8>) {
+    assert!(
+        src.len() % 4 == 0,
+        "ARGB2101010 data length must be a multiple of 4"
+    );
+    dst.resize(src.len(), 0);
+
+    let pixel_count = src.len() / 4;
+    for i in 0..pixel_count {
+        let off = i * 4;
+        // Read as little-endian u32.
+        let packed = u32::from_le_bytes([src[off], src[off + 1], src[off + 2], src[off + 3]]);
+
+        // macOS ARGB2101010 ('l10r') layout (little-endian):
+        //   bits [9:0]   = Blue  (10 bits)
+        //   bits [19:10] = Green (10 bits)
+        //   bits [29:20] = Red   (10 bits)
+        //   bits [31:30] = Alpha (2 bits)
+
+        // Down-shift 10-bit → 8-bit: keep top 8 of 10 significant bits.
+        // For a 10-bit value v, `(v >> 2)` maps 0..1023 → 0..255.
+        let b = ((packed & 0x3FF) >> 2) as u8;
+        let g = (((packed >> 10) & 0x3FF) >> 2) as u8;
+        let r = (((packed >> 20) & 0x3FF) >> 2) as u8;
+        // Expand 2-bit alpha → 8-bit: 0→0, 1→85, 2→170, 3→255.
+        let a2 = ((packed >> 30) & 0x3) as u8;
+        let a = a2 * 85;
+
+        // Output in BGRA order.
+        dst[off] = b;
+        dst[off + 1] = g;
+        dst[off + 2] = r;
+        dst[off + 3] = a;
+    }
+}
+
 #[cfg(not(target_os = "ios"))]
 pub fn convert(captured: &PixelBuffer, pixfmt: crate::Pixfmt, dst: &mut Vec<u8>) -> ResultType<()> {
     if captured.pixfmt() == pixfmt {
