@@ -730,10 +730,27 @@ pub fn start_os_service() {
         println!("Failed to set Ctrl-C handler: {}", err);
     }
 
+    // Headless Wayland compositor: started on-demand when we detect a headless
+    // environment with no WAYLAND_DISPLAY. The compositor provides a Wayland
+    // socket so PipeWire portal-based screen capture can function.
+    let mut headless_compositor: Option<super::headless_compositor::HeadlessCompositor> = None;
+
     let mut cm0 = false;
     let mut last_restart = Instant::now();
     while running.load(Ordering::SeqCst) {
         desktop.refresh();
+
+        // Headless compositor management: if we are headless, headless mode
+        // is allowed, and no WAYLAND_DISPLAY is set, try to start a compositor.
+        if desktop.is_headless() && is_headless_allowed() {
+            maybe_start_headless_compositor(&mut headless_compositor);
+        } else if !desktop.is_headless() {
+            // A real session appeared; stop any headless compositor we started.
+            stop_headless_compositor(&mut headless_compositor);
+        }
+
+        // If the headless compositor crashed, restart it.
+        check_headless_compositor_health(&mut headless_compositor);
 
         // Duplicate logic here with should_start_server
         // Login wayland will try to start a headless --server.
@@ -796,6 +813,9 @@ pub fn start_os_service() {
         }
     }
 
+    // Clean up headless compositor on exit.
+    stop_headless_compositor(&mut headless_compositor);
+
     if let Some(ps) = user_server.take().as_mut() {
         allow_err!(ps.kill());
     }
@@ -803,6 +823,88 @@ pub fn start_os_service() {
         allow_err!(ps.kill());
     }
     log::info!("Exit");
+}
+
+/// Try to start a headless Wayland compositor if one is not already running
+/// and no WAYLAND_DISPLAY is set in the environment.
+fn maybe_start_headless_compositor(
+    compositor: &mut Option<super::headless_compositor::HeadlessCompositor>,
+) {
+    use super::headless_compositor;
+
+    // Already running — nothing to do.
+    if compositor.is_some() {
+        return;
+    }
+
+    // If WAYLAND_DISPLAY is already set (e.g. by a real compositor), skip.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        return;
+    }
+
+    let config_val = Config::get_option("headless-compositor");
+    let typ = match headless_compositor::compositor_from_config(&config_val) {
+        Some(t) => t,
+        None => {
+            // "none" or no compositor available — don't start anything.
+            return;
+        }
+    };
+
+    let resolution = Config::get_option("headless-resolution");
+    let resolution = if resolution.is_empty() {
+        "1920x1080"
+    } else {
+        &resolution
+    };
+
+    match headless_compositor::HeadlessCompositor::start(typ, resolution) {
+        Ok(hc) => {
+            log::info!(
+                "Headless compositor started: {} (WAYLAND_DISPLAY={})",
+                typ.name(),
+                hc.wayland_display()
+            );
+            // Set WAYLAND_DISPLAY so child --server processes inherit it.
+            std::env::set_var("WAYLAND_DISPLAY", hc.wayland_display());
+            *compositor = Some(hc);
+        }
+        Err(e) => {
+            log::error!("Failed to start headless compositor ({}): {}", typ.name(), e);
+        }
+    }
+}
+
+/// Stop the headless compositor and unset WAYLAND_DISPLAY if we set it.
+fn stop_headless_compositor(
+    compositor: &mut Option<super::headless_compositor::HeadlessCompositor>,
+) {
+    if let Some(mut hc) = compositor.take() {
+        log::info!("Stopping headless compositor: {}", hc.compositor_type().name());
+        hc.stop();
+        // Only remove WAYLAND_DISPLAY if it still points to our socket.
+        if let Ok(val) = std::env::var("WAYLAND_DISPLAY") {
+            if val == hc.wayland_display() {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
+        }
+    }
+}
+
+/// Check if the headless compositor has crashed and restart it if needed.
+fn check_headless_compositor_health(
+    compositor: &mut Option<super::headless_compositor::HeadlessCompositor>,
+) {
+    let exited = match compositor.as_mut() {
+        Some(hc) => hc.has_exited(),
+        None => return,
+    };
+
+    if exited {
+        log::warn!("Headless compositor exited unexpectedly, will restart on next cycle");
+        // Drop the old compositor (also unsets WAYLAND_DISPLAY).
+        stop_headless_compositor(compositor);
+    }
 }
 
 #[inline]
