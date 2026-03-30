@@ -54,6 +54,12 @@ impl TraitCapturer for Capturer {
                 w,
                 h,
             ))),
+            PixelProvider::BGR10A2(w, h, x) => Ok(Frame::PixelBuffer(PixelBuffer::new(
+                x,
+                crate::Pixfmt::ARGB2101010,
+                w,
+                h,
+            ))),
             PixelProvider::NONE => Err(std::io::ErrorKind::WouldBlock.into()),
             _ => Err(map_err("Invalid data")),
         }

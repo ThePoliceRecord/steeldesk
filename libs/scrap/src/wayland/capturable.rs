@@ -8,6 +8,8 @@ pub enum PixelProvider<'a> {
     BGR0(usize, usize, &'a [u8]),
     // width, height, stride
     BGR0S(usize, usize, usize, &'a [u8]),
+    // 10-bit packed: ARGB2101010 / BGR10A2_LE (2 alpha + 10+10+10 color)
+    BGR10A2(usize, usize, &'a [u8]),
     NONE,
 }
 
@@ -18,6 +20,7 @@ impl<'a> PixelProvider<'a> {
             PixelProvider::RGB0(w, h, _) => (*w, *h),
             PixelProvider::BGR0(w, h, _) => (*w, *h),
             PixelProvider::BGR0S(w, h, _, _) => (*w, *h),
+            PixelProvider::BGR10A2(w, h, _) => (*w, *h),
             PixelProvider::NONE => (0, 0),
         }
     }

@@ -327,6 +327,15 @@ impl PipeWireRecorder {
             "video/x-raw",
             &[("format", &"RGBx")],
         ));
+        // 10-bit HDR formats (negotiated when compositor supports them).
+        // BGR10A2_LE is the GStreamer name for DRM_FORMAT_ARGB2101010:
+        // each pixel is a 32-bit word with 2-bit alpha and 10 bits per B/G/R
+        // channel.  KDE Plasma 6 and GNOME 46+ expose this when displays are
+        // configured for 10-bit depth.
+        caps.merge_structure(gst::structure::Structure::new(
+            "video/x-raw",
+            &[("format", &"BGR10A2_LE")],
+        ));
         appsink.set_caps(Some(&caps));
 
         // [Workaround]
@@ -468,6 +477,7 @@ impl Recorder for PipeWireRecorder {
         match self.pix_fmt.as_str() {
             "BGRx" => Ok(PixelProvider::BGR0(self.width, self.height, buf)),
             "RGBx" => Ok(PixelProvider::RGB0(self.width, self.height, buf)),
+            "BGR10A2_LE" => Ok(PixelProvider::BGR10A2(self.width, self.height, buf)),
             _ => Err(Box::new(GStreamerError(format!(
                 "Unreachable! Unknown pix_fmt, {}",
                 &self.pix_fmt
@@ -1441,6 +1451,8 @@ fn fill_multi_matched_positions_cursor(
                     match rec.capture(CAPTURE_TIMEOUT_MS) {
                         Ok(PixelProvider::BGR0(w, _, data1)) => (true, w, data1.to_vec()),
                         Ok(PixelProvider::RGB0(w, _, data1)) => (false, w, data1.to_vec()),
+                        // BGR10A2_LE is still 4 bytes/pixel, treat like BGR for disambiguation
+                        Ok(PixelProvider::BGR10A2(w, _, data1)) => (true, w, data1.to_vec()),
                         Ok(_) => {
                             error!("Unexpected pixel format on first capture.");
                             continue;
@@ -1466,7 +1478,10 @@ fn fill_multi_matched_positions_cursor(
                         mouse_move_to_(&mouse_move_to, get_cursor_pos, wd.x + 8, wd.y + 8);
                         rec.saved_raw_data.clear();
                         match rec.capture(CAPTURE_TIMEOUT_MS) {
-                            Ok(PixelProvider::BGR0(_, _, data2)) if is_bgr => {
+                            Ok(PixelProvider::BGR0(_, _, data2))
+                            | Ok(PixelProvider::BGR10A2(_, _, data2))
+                                if is_bgr =>
+                            {
                                 if compare_left_up_corner(w, &first_buf, data2) {
                                     d.0.position = (wd.x, wd.y);
                                     pw_stream.position = (wd.x, wd.y);

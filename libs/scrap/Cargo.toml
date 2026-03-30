@@ -53,6 +53,7 @@ pkg-config = { version = "0.3.27", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = { version = "0.9", optional = true }
+libc = "0.2"
 tracing = { version = "0.1", optional = true }
 gstreamer = { version = "0.16", optional = true }
 gstreamer-app = { version = "0.16", features = ["v1_10"], optional = true }

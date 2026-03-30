@@ -84,3 +84,5 @@ pub mod cursor_prediction;
 pub mod transport;
 
 pub mod hdr;
+
+pub mod session_store;

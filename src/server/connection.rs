@@ -1,4 +1,5 @@
 use super::{input_service::*, *};
+use crate::session_store;
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::clipboard::try_empty_clipboard_files;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -68,7 +69,23 @@ use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
 lazy_static::lazy_static! {
-    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
+    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = {
+        // Hydrate in-memory failure maps from persistent store so counters
+        // survive service restarts.
+        let store = session_store::global_store();
+        let mut maps: [Arc<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
+        for (idx, map) in maps.iter_mut().enumerate() {
+            let keys = store.get_all_failure_keys(idx);
+            let mut m = map.lock().unwrap();
+            for key in keys {
+                let val = store.get_failure(idx, &key);
+                if val != (0, 0, 0) {
+                    m.insert(key, val);
+                }
+            }
+        }
+        maps
+    };
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
@@ -3657,6 +3674,7 @@ impl Connection {
             }
             cur
         }
+        let store = session_store::global_store();
         let map_mutex = &LOGIN_FAILURES[i];
         if remove {
             if failure.0 != 0 {
@@ -3666,8 +3684,14 @@ impl Connection {
                     m.remove(&p56);
                     m.remove(&p48);
                     m.remove(&self.ip);
+                    drop(m);
+                    store.remove_failure(i, &p64);
+                    store.remove_failure(i, &p56);
+                    store.remove_failure(i, &p48);
+                    store.remove_failure(i, &self.ip);
                 } else {
                     map_mutex.lock().unwrap().remove(&self.ip);
+                    store.remove_failure(i, &self.ip);
                 }
             }
             return;
@@ -3675,16 +3699,27 @@ impl Connection {
         // Bump the prefixes, fetching existing values
         if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
             let mut m = map_mutex.lock().unwrap();
-            for key in [p64, p56, p48] {
+            for key in [p64.clone(), p56.clone(), p48.clone()] {
                 let cur = m.get(&key).copied().unwrap_or((0, 0, 0));
-                m.insert(key, bump(cur, time));
+                let new_val = bump(cur, time);
+                m.insert(key, new_val);
             }
             // Update full IP: bump from the *original* passed-in failure
-            m.insert(self.ip.clone(), bump(failure, time));
+            let new_ip_val = bump(failure, time);
+            m.insert(self.ip.clone(), new_ip_val);
+            drop(m);
+            // Persist all updated entries.
+            for key in [&p64, &p56, &p48, &self.ip] {
+                let val = LOGIN_FAILURES[i].lock().unwrap().get(key).copied().unwrap_or((0,0,0));
+                store.set_failure(i, key, val);
+            }
         } else {
             // Update full IP: bump from the *original* passed-in failure
             let mut m = map_mutex.lock().unwrap();
-            m.insert(self.ip.clone(), bump(failure, time));
+            let new_val = bump(failure, time);
+            m.insert(self.ip.clone(), new_val);
+            drop(m);
+            store.set_failure(i, &self.ip, new_val);
         }
     }
 
@@ -5699,7 +5734,15 @@ mod raii {
                 });
                 if is_remote || !another_remote {
                     lock.remove(&key);
+                    drop(lock);
                     log::info!("remove session");
+                    // Also remove from persistent store.
+                    let store_key = session_store::session_map_key(
+                        &key.peer_id,
+                        &key.name,
+                        key.session_id,
+                    );
+                    session_store::global_store().remove_session(&store_key);
                 } else {
                     // Keep the session if there is another remote connection with same peer_id and session_id.
                     log::info!("skip remove session");
@@ -5712,6 +5755,9 @@ mod raii {
             password: Option<String>,
             tfa: Option<bool>,
         ) {
+            // Clone for the persistent store before the in-memory mutation
+            // consumes the Option.
+            let pw_for_store = password.clone();
             let mut lock = SESSIONS.lock().unwrap();
             let session = lock.get_mut(&key);
             if let Some(session) = session {
@@ -5723,7 +5769,7 @@ mod raii {
                 }
             } else {
                 lock.insert(
-                    key,
+                    key.clone(),
                     Session {
                         random_password: password.unwrap_or_default(),
                         tfa: tfa.unwrap_or_default(),
@@ -5731,6 +5777,21 @@ mod raii {
                     },
                 );
             }
+            drop(lock);
+            // Persist to disk.
+            let store_key = session_store::session_map_key(
+                &key.peer_id,
+                &key.name,
+                key.session_id,
+            );
+            session_store::global_store().upsert_session(
+                store_key,
+                &key.peer_id,
+                &key.name,
+                key.session_id,
+                pw_for_store,
+                tfa,
+            );
         }
 
         pub fn set_session_2fa(key: SessionKey) {
@@ -5740,7 +5801,7 @@ mod raii {
                 session.tfa = true;
             } else {
                 lock.insert(
-                    key,
+                    key.clone(),
                     Session {
                         last_recv_time: Arc::new(Mutex::new(Instant::now())),
                         random_password: "".to_owned(),
@@ -5748,6 +5809,21 @@ mod raii {
                     },
                 );
             }
+            drop(lock);
+            // Persist to disk.
+            let store_key = session_store::session_map_key(
+                &key.peer_id,
+                &key.name,
+                key.session_id,
+            );
+            session_store::global_store().upsert_session(
+                store_key,
+                &key.peer_id,
+                &key.name,
+                key.session_id,
+                None,
+                Some(true),
+            );
         }
 
         pub fn conn_type(&self) -> AuthConnType {

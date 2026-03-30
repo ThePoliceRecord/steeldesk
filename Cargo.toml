@@ -236,6 +236,7 @@ os-version = "0.2"
 hound = "3.5"
 docopt = "1.1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [[bench]]
 name = "perf_benchmarks"
