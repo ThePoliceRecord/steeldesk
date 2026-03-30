@@ -1149,6 +1149,7 @@ pub fn test_av1() {
                     height,
                     quality,
                     keyframe_interval,
+                    hdr: false,
                 }),
                 i444,
             ) else {

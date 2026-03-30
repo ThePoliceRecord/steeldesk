@@ -16,6 +16,7 @@ cfg_if! {
                 mod linux;
                 mod wayland;
                 mod x11;
+                pub mod drm_capture;
                 pub use self::linux::*;
                 pub use self::wayland::set_map_err;
                 pub use self::x11::PixelBuffer;
@@ -103,6 +104,72 @@ pub struct ImageTexture {
     pub texture: *mut c_void,
     pub w: usize,
     pub h: usize,
+}
+
+/// Represents a DMA-BUF frame for zero-copy GPU pipeline on Linux.
+///
+/// A DMA-BUF (Direct Memory Access Buffer) is a Linux kernel mechanism for
+/// sharing buffers between hardware devices without CPU copies. In the
+/// zero-copy video pipeline, PipeWire exports captured frames as DMA-BUF
+/// file descriptors which can be directly imported into VAAPI surfaces for
+/// hardware encoding.
+///
+/// # Zero-copy path (target)
+///
+/// ```text
+/// PipeWire DMA-BUF fd -> import into VAAPI surface -> VAAPI encode -> network
+/// ```
+///
+/// # Current path (with CPU round-trip)
+///
+/// ```text
+/// PipeWire -> CPU copy -> BGRA buffer -> YUV convert (CPU) -> HW encode (GPU)
+/// ```
+///
+/// # Safety
+///
+/// The `fd` field is a raw file descriptor. The caller is responsible for
+/// ensuring the fd remains valid for the lifetime of this struct and is
+/// properly closed when no longer needed. In practice, PipeWire manages
+/// the fd lifetime through its buffer pool.
+#[derive(Debug, Clone)]
+pub struct DmaBufFrame {
+    /// DMA-BUF file descriptor, obtained from PipeWire's buffer pool.
+    /// This fd can be imported into VAAPI via `vaCreateSurfaces` with
+    /// `VASurfaceAttribExternalBuffers`.
+    pub fd: i32,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Row stride in bytes (distance between the start of consecutive rows).
+    pub stride: u32,
+    /// Offset in bytes from the start of the buffer to the first pixel.
+    pub offset: u32,
+    /// DRM pixel format fourcc code (e.g., `DRM_FORMAT_NV12 = 0x3231564E`).
+    /// These constants are defined in `<drm_fourcc.h>`.
+    pub format: u32,
+    /// DRM format modifier describing the memory layout (tiling, compression).
+    /// `DRM_FORMAT_MOD_LINEAR = 0` for simple row-major layout.
+    /// `DRM_FORMAT_MOD_INVALID = 0x00ffffffffffffff` when unknown.
+    pub modifier: u64,
+}
+
+impl DmaBufFrame {
+    /// Well-known DRM format modifier for linear (row-major) layout.
+    pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+    /// Well-known DRM format modifier meaning "unspecified/invalid".
+    pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
+
+    /// DRM fourcc for NV12 (the most common VAAPI input format).
+    /// Corresponds to `DRM_FORMAT_NV12` from `<drm_fourcc.h>`.
+    pub const DRM_FORMAT_NV12: u32 = 0x3231564E;
+
+    /// Returns true if this frame uses a linear (non-tiled) memory layout.
+    pub fn is_linear(&self) -> bool {
+        self.modifier == Self::DRM_FORMAT_MOD_LINEAR
+    }
 }
 
 impl Default for ImageTexture {

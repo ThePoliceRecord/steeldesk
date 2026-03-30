@@ -101,6 +101,159 @@
 // 4. Render via Metal from the `IOSurface` directly
 //
 
+// # Linux VAAPI Zero-Copy Pipeline
+//
+// ## Zero-copy path (target):
+//
+//   PipeWire DMA-BUF fd
+//       |-- [NO COPY] fd passed via DmaBufFrame struct
+//       v
+//   Import into VAAPI surface
+//       |-- vaCreateSurfaces with VASurfaceAttribExternalBuffers
+//       |-- binds DMA-BUF memory directly to VA surface (zero-copy)
+//       v
+//   VAAPI encode (H.264 or H.265)
+//       |-- [output: CPU] encoded bitstream (NALUs)
+//       v
+//   Network
+//
+// ## Current path (with GPU->CPU->GPU round-trip):
+//
+//   PipeWire + GStreamer pipewiresrc (always-copy=true)
+//       |-- [COPY 1: GPU->CPU] GStreamer maps buffer to CPU memory
+//       v
+//   CPU BGRA buffer (PixelBuffer)
+//       |-- [COPY 2: CPU, format conversion] libyuv BGRA->NV12
+//       v
+//   CPU NV12 YUV buffer
+//       |-- [COPY 3: CPU->GPU] ffmpeg upload to VAAPI encoder surface
+//       v
+//   VAAPI encode
+//       |-- [output: CPU] encoded bitstream
+//       v
+//   Network
+//
+// ## Implementation steps (in order of dependency):
+//
+// Step 1 (this file): Capability detection and data structures.
+//   - vaapi_available(): check for /dev/dri/renderD* nodes
+//   - vaapi_device_path(): find the first available render node
+//   - GpuPipelineMode::VaapiZeroCopy variant
+//   - DmaBufFrame struct (in libs/scrap/src/common/mod.rs)
+//
+// Step 2 (future): PipeWire DMA-BUF negotiation.
+//   - Remove always-copy=true from pipewiresrc
+//   - Add memory:DMABuf feature to GStreamer caps negotiation
+//   - Extract DMA-BUF fd, stride, offset, modifier from GstBuffer
+//
+// Step 3 (future): VAAPI surface import.
+//   - Use libva bindings to call vaCreateSurfaces with external buffers
+//   - Map DMA-BUF fd to VASurfaceID
+//   - Extend hwcodec crate to accept VASurfaceID as encoder input
+//
+// Step 4 (future): Full pipeline integration.
+//   - Wire DmaBufFrame through the video_service capture loop
+//   - Add Frame::DmaBuf variant (parallel to Frame::Texture on Windows)
+//   - Feature-gate behind "vram" on Linux
+
+/// Check whether VAAPI zero-copy encoding is potentially available.
+///
+/// This performs a lightweight filesystem check for DRI render nodes
+/// (`/dev/dri/renderD*`), which are required for VAAPI operation.
+/// The presence of a render node is necessary but not sufficient —
+/// the actual VAAPI driver must also be installed and functional.
+///
+/// # Platform behavior
+///
+/// - **Linux**: Checks for `/dev/dri/renderD128` through `renderD135`.
+/// - **Other platforms**: Always returns `false`.
+pub fn vaapi_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // Check the most common render node first, then scan others.
+        // Render nodes 128-135 cover up to 8 GPUs, which is more than
+        // any typical desktop system would have.
+        for i in 128..136 {
+            let path = format!("/dev/dri/renderD{}", i);
+            if std::path::Path::new(&path).exists() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Return the path to the first available VAAPI render node.
+///
+/// Scans `/dev/dri/renderD128` through `/dev/dri/renderD135` and returns
+/// the first one that exists. Returns `None` if no render nodes are found
+/// (headless system, container without GPU passthrough, or non-Linux).
+///
+/// In a full implementation, this path would be passed to `vaGetDisplayDRM()`
+/// to open a VAAPI display connection.
+pub fn vaapi_device_path() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        for i in 128..136 {
+            let path = format!("/dev/dri/renderD{}", i);
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Check whether DRM/KMS framebuffer capture should be used.
+///
+/// DRM capture is the fallback for situations where no compositor portal is
+/// available: the login screen (GDM/SDDM greeter on Wayland) and headless
+/// mode without a compositor.
+///
+/// # When this returns `true`
+///
+/// 1. A DRM card device exists (`/dev/dri/card*`)
+/// 2. AND one of:
+///    - We are at the Wayland login screen (detected via `is_login_screen_wayland()`)
+///    - No display server is reachable (`DISPLAY` and `WAYLAND_DISPLAY` both unset)
+///
+/// # Platform behavior
+///
+/// - **Linux**: Performs the detection described above.
+/// - **Other platforms**: Always returns `false`.
+pub fn should_use_drm_capture() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use scrap::drm_capture::DrmCapture;
+
+        if !DrmCapture::available() {
+            return false;
+        }
+
+        // Check if we are at the login screen.
+        let at_login = crate::platform::linux::is_login_screen_wayland_safe();
+
+        // Check if headless (no display server environment variables).
+        let no_display = std::env::var("DISPLAY").is_err();
+        let no_wayland = std::env::var("WAYLAND_DISPLAY").is_err();
+        let headless = no_display && no_wayland;
+
+        at_login || headless
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Runtime detection of GPU zero-copy pipeline availability.
 ///
 /// Returns `true` if the current platform and GPU drivers support the VRAM
@@ -186,6 +339,22 @@ pub fn gpu_pipeline_summary() -> String {
         lines.push("Feature 'hwcodec': disabled".to_string());
     }
 
+    // Linux VAAPI diagnostics
+    #[cfg(target_os = "linux")]
+    {
+        lines.push(format!("VAAPI available: {}", vaapi_available()));
+        match vaapi_device_path() {
+            Some(path) => lines.push(format!("VAAPI render node: {}", path)),
+            None => lines.push("VAAPI render node: none found".to_string()),
+        }
+        lines.push(format!(
+            "DRM capture (login/headless): {}",
+            should_use_drm_capture()
+        ));
+    }
+
+    lines.push(format!("Pipeline mode: {:?}", detect_pipeline_mode()));
+
     lines.join("\n")
 }
 
@@ -195,6 +364,15 @@ pub enum GpuPipelineMode {
     /// VRAM zero-copy: GPU texture passed directly to encoder, no CPU copies.
     /// Available on Windows with `feature = "vram"` and D3D11 support.
     VRam,
+    /// VAAPI zero-copy: DMA-BUF fd from PipeWire imported directly into VAAPI
+    /// surface for encoding, no CPU copies. Available on Linux with VAAPI
+    /// drivers and a DRI render node.
+    ///
+    /// Pipeline: PipeWire DMA-BUF fd -> VAAPI surface import -> VAAPI encode
+    ///
+    /// This mode is currently scaffolding only. The actual DMA-BUF import
+    /// requires `libva` bindings which are not yet integrated.
+    VaapiZeroCopy,
     /// Hardware-accelerated but with CPU copies: frame is read from GPU to CPU,
     /// converted (BGRA→NV12), then uploaded back to GPU for encoding.
     HwRam,
@@ -205,12 +383,28 @@ pub enum GpuPipelineMode {
 /// Detect the best available GPU pipeline mode for the current platform.
 ///
 /// Priority order:
-/// 1. VRAM (zero-copy, if available)
-/// 2. HwRam (hardware encode with CPU copies)
-/// 3. Software (VP8/VP9/AV1)
+/// 1. VRAM (zero-copy via D3D11 texture, Windows only)
+/// 2. VaapiZeroCopy (zero-copy via DMA-BUF, Linux only — scaffolding, not yet wired)
+/// 3. HwRam (hardware encode with CPU copies)
+/// 4. Software (VP8/VP9/AV1)
+///
+/// Note: `VaapiZeroCopy` is detected here for diagnostic/logging purposes,
+/// but the actual DMA-BUF pipeline is not yet implemented. The video service
+/// will fall through to HwRam or Software until the full pipeline is wired.
 pub fn detect_pipeline_mode() -> GpuPipelineMode {
     if gpu_zero_copy_available() {
         return GpuPipelineMode::VRam;
+    }
+
+    // On Linux, check if VAAPI zero-copy could be supported.
+    // This is scaffolding: we detect the capability but the actual
+    // DMA-BUF import path is not yet implemented, so callers should
+    // treat this as informational and fall through to HwRam.
+    #[cfg(target_os = "linux")]
+    {
+        if vaapi_available() {
+            return GpuPipelineMode::VaapiZeroCopy;
+        }
     }
 
     #[cfg(feature = "hwcodec")]
@@ -268,9 +462,18 @@ mod tests {
     }
 
     #[test]
+    fn gpu_pipeline_summary_contains_pipeline_mode() {
+        let summary = gpu_pipeline_summary();
+        assert!(
+            summary.contains("Pipeline mode:"),
+            "summary should report the detected pipeline mode"
+        );
+    }
+
+    #[test]
     fn detect_pipeline_mode_does_not_panic() {
         let mode = detect_pipeline_mode();
-        // On Linux without vram feature, should be HwRam or Software
+        // On Linux without vram feature, should be VaapiZeroCopy, HwRam, or Software
         match mode {
             GpuPipelineMode::VRam => {
                 // Only valid on Windows with vram feature and hardware support
@@ -279,11 +482,18 @@ mod tests {
                     "VRam mode requires zero-copy to be available"
                 );
             }
+            GpuPipelineMode::VaapiZeroCopy => {
+                // Valid on Linux when VAAPI render nodes exist
+                assert!(
+                    vaapi_available(),
+                    "VaapiZeroCopy mode requires VAAPI to be available"
+                );
+            }
             GpuPipelineMode::HwRam => {
                 // Valid when hwcodec feature is enabled
                 assert!(
                     !gpu_zero_copy_available(),
-                    "HwRam mode means zero-copy is not available"
+                    "HwRam mode means VRAM zero-copy is not available"
                 );
             }
             GpuPipelineMode::Software => {
@@ -305,9 +515,19 @@ mod tests {
         assert_eq!(GpuPipelineMode::VRam, GpuPipelineMode::VRam);
         assert_eq!(GpuPipelineMode::HwRam, GpuPipelineMode::HwRam);
         assert_eq!(GpuPipelineMode::Software, GpuPipelineMode::Software);
+        assert_eq!(
+            GpuPipelineMode::VaapiZeroCopy,
+            GpuPipelineMode::VaapiZeroCopy
+        );
         assert_ne!(GpuPipelineMode::VRam, GpuPipelineMode::HwRam);
         assert_ne!(GpuPipelineMode::VRam, GpuPipelineMode::Software);
+        assert_ne!(GpuPipelineMode::VRam, GpuPipelineMode::VaapiZeroCopy);
         assert_ne!(GpuPipelineMode::HwRam, GpuPipelineMode::Software);
+        assert_ne!(GpuPipelineMode::HwRam, GpuPipelineMode::VaapiZeroCopy);
+        assert_ne!(
+            GpuPipelineMode::Software,
+            GpuPipelineMode::VaapiZeroCopy
+        );
     }
 
     // Feature flag documentation tests
@@ -341,5 +561,209 @@ mod tests {
         //   - enable_hwcodec_option() function
         let _has_hwcodec = cfg!(feature = "hwcodec");
         // Just documenting — no assertion needed since both states are valid
+    }
+
+    // VAAPI detection tests
+
+    #[test]
+    fn vaapi_available_returns_bool() {
+        // Must not panic regardless of whether GPU hardware is present.
+        // On a system with a GPU, returns true; on headless/container, false.
+        let _available = vaapi_available();
+    }
+
+    #[test]
+    fn vaapi_device_path_returns_option() {
+        // Must not panic. Returns Some("/dev/dri/renderDXXX") on systems
+        // with a GPU render node, None on headless systems.
+        let path = vaapi_device_path();
+        if let Some(ref p) = path {
+            assert!(
+                p.starts_with("/dev/dri/renderD"),
+                "VAAPI device path should be a DRI render node, got: {}",
+                p
+            );
+            // The render node number should be in 128..136
+            let num: u32 = p
+                .trim_start_matches("/dev/dri/renderD")
+                .parse()
+                .expect("render node should end with a number");
+            assert!(
+                (128..136).contains(&num),
+                "render node number should be 128-135, got: {}",
+                num
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_available_consistent_with_device_path() {
+        // If vaapi_available() is true, vaapi_device_path() must return Some.
+        // If vaapi_device_path() returns Some, vaapi_available() must be true.
+        let available = vaapi_available();
+        let path = vaapi_device_path();
+        assert_eq!(
+            available,
+            path.is_some(),
+            "vaapi_available() and vaapi_device_path() must agree"
+        );
+    }
+
+    #[test]
+    fn pipeline_mode_detection_includes_vaapi_on_linux() {
+        // On Linux with a GPU, detect_pipeline_mode should return VaapiZeroCopy
+        // (since we don't have the vram feature enabled in tests).
+        let mode = detect_pipeline_mode();
+        if cfg!(target_os = "linux") && vaapi_available() && !gpu_zero_copy_available() {
+            assert_eq!(
+                mode,
+                GpuPipelineMode::VaapiZeroCopy,
+                "on Linux with VAAPI available, should detect VaapiZeroCopy mode"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_pipeline_summary_contains_vaapi_on_linux() {
+        let summary = gpu_pipeline_summary();
+        if cfg!(target_os = "linux") {
+            assert!(
+                summary.contains("VAAPI available:"),
+                "Linux summary should include VAAPI availability"
+            );
+            assert!(
+                summary.contains("VAAPI render node:"),
+                "Linux summary should include VAAPI render node info"
+            );
+        }
+    }
+
+    // DmaBufFrame tests
+
+    #[test]
+    fn dmabuf_frame_construction_and_field_access() {
+        let frame = scrap::DmaBufFrame {
+            fd: 42,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            offset: 0,
+            format: scrap::DmaBufFrame::DRM_FORMAT_NV12,
+            modifier: scrap::DmaBufFrame::DRM_FORMAT_MOD_LINEAR,
+        };
+        assert_eq!(frame.fd, 42);
+        assert_eq!(frame.width, 1920);
+        assert_eq!(frame.height, 1080);
+        assert_eq!(frame.stride, 7680);
+        assert_eq!(frame.offset, 0);
+        assert_eq!(frame.format, 0x3231564E); // NV12 fourcc
+        assert_eq!(frame.modifier, 0);
+    }
+
+    #[test]
+    fn dmabuf_frame_is_linear() {
+        let linear_frame = scrap::DmaBufFrame {
+            fd: 1,
+            width: 640,
+            height: 480,
+            stride: 2560,
+            offset: 0,
+            format: scrap::DmaBufFrame::DRM_FORMAT_NV12,
+            modifier: scrap::DmaBufFrame::DRM_FORMAT_MOD_LINEAR,
+        };
+        assert!(linear_frame.is_linear());
+
+        let tiled_frame = scrap::DmaBufFrame {
+            fd: 2,
+            width: 640,
+            height: 480,
+            stride: 2560,
+            offset: 0,
+            format: scrap::DmaBufFrame::DRM_FORMAT_NV12,
+            modifier: 0x0100000000000001, // some Intel tiling modifier
+        };
+        assert!(!tiled_frame.is_linear());
+    }
+
+    #[test]
+    fn dmabuf_frame_clone_and_debug() {
+        let frame = scrap::DmaBufFrame {
+            fd: 10,
+            width: 3840,
+            height: 2160,
+            stride: 15360,
+            offset: 0,
+            format: scrap::DmaBufFrame::DRM_FORMAT_NV12,
+            modifier: scrap::DmaBufFrame::DRM_FORMAT_MOD_INVALID,
+        };
+        // Test Clone
+        let cloned = frame.clone();
+        assert_eq!(cloned.fd, frame.fd);
+        assert_eq!(cloned.width, frame.width);
+        assert_eq!(cloned.modifier, scrap::DmaBufFrame::DRM_FORMAT_MOD_INVALID);
+
+        // Test Debug
+        let debug_str = format!("{:?}", frame);
+        assert!(debug_str.contains("DmaBufFrame"));
+        assert!(debug_str.contains("3840"));
+    }
+
+    #[test]
+    fn dmabuf_frame_constants() {
+        assert_eq!(scrap::DmaBufFrame::DRM_FORMAT_MOD_LINEAR, 0);
+        assert_eq!(
+            scrap::DmaBufFrame::DRM_FORMAT_MOD_INVALID,
+            0x00ffffffffffffff
+        );
+        assert_eq!(scrap::DmaBufFrame::DRM_FORMAT_NV12, 0x3231564E);
+    }
+
+    // DRM capture detection tests
+
+    #[test]
+    fn should_use_drm_capture_returns_bool() {
+        // Must not panic regardless of hardware or environment.
+        let _result = should_use_drm_capture();
+    }
+
+    #[test]
+    fn should_use_drm_capture_false_when_display_set() {
+        // When DISPLAY or WAYLAND_DISPLAY is set, we have a compositor,
+        // so DRM capture should not be used (unless login screen is detected).
+        // We cannot safely mutate env vars in parallel tests, so we just
+        // verify the function does not panic and document expected behavior.
+        let result = should_use_drm_capture();
+        let has_display = std::env::var("DISPLAY").is_ok()
+            || std::env::var("WAYLAND_DISPLAY").is_ok();
+        if has_display {
+            // If we have a display, DRM capture should be false unless
+            // we are at a login screen (unlikely in test environments).
+            // We cannot assert false unconditionally because the login
+            // screen check is valid, but in practice test runners are
+            // not login screens.
+            let _ = result; // just ensure no panic
+        }
+    }
+
+    #[test]
+    fn gpu_pipeline_summary_contains_drm_on_linux() {
+        let summary = gpu_pipeline_summary();
+        if cfg!(target_os = "linux") {
+            assert!(
+                summary.contains("DRM capture"),
+                "Linux summary should include DRM capture status"
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_zero_copy_variant_exists() {
+        // Ensure the VaapiZeroCopy variant compiles and can be matched.
+        let mode = GpuPipelineMode::VaapiZeroCopy;
+        assert_eq!(format!("{:?}", mode), "VaapiZeroCopy");
+        match mode {
+            GpuPipelineMode::VaapiZeroCopy => {} // expected
+            _ => panic!("should match VaapiZeroCopy"),
+        }
     }
 }

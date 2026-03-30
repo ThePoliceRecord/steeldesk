@@ -105,6 +105,7 @@ fn main() -> io::Result<()> {
             quality,
             codec: vpx_codec,
             keyframe_interval: None,
+            hdr: false,
         }),
         false,
     )

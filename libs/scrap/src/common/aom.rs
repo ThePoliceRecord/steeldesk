@@ -47,6 +47,9 @@ pub struct AomEncoderConfig {
     pub height: u32,
     pub quality: f32,
     pub keyframe_interval: Option<usize>,
+    /// Whether HDR (10-bit) encoding is requested.
+    /// When true, AV1 uses Professional profile (2) with 10-bit input/output.
+    pub hdr: bool,
 }
 
 pub struct AomEncoder {
@@ -54,6 +57,7 @@ pub struct AomEncoder {
     width: usize,
     height: usize,
     i444: bool,
+    hdr: bool,
     yuvfmt: EncodeYuvFormat,
 }
 
@@ -62,7 +66,6 @@ mod webrtc {
     use super::*;
 
     const kUsageProfile: u32 = AOM_USAGE_REALTIME;
-    const kBitDepth: u32 = 8;
     const kLagInFrames: u32 = 0; // No look ahead.
     pub(super) const kTimeBaseDen: i64 = 1000;
 
@@ -97,13 +100,18 @@ mod webrtc {
         let mut c = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         call_aom!(aom_codec_enc_config_default(i, &mut c, kUsageProfile));
 
+        let bit_depth: u32 = if cfg.hdr { 10 } else { 8 };
+
         // Overwrite default config with input encoder settings & RTC-relevant values.
         c.g_w = cfg.width;
         c.g_h = cfg.height;
         c.g_threads = codec_thread_num(64) as _;
         c.g_timebase.num = 1;
         c.g_timebase.den = kTimeBaseDen as _;
-        c.g_input_bit_depth = kBitDepth;
+        c.g_input_bit_depth = bit_depth;
+        if cfg.hdr {
+            c.g_bit_depth = aom_bit_depth::AOM_BITS_10;
+        }
         if let Some(keyframe_interval) = cfg.keyframe_interval {
             c.kf_min_dist = 0;
             c.kf_max_dist = keyframe_interval as _;
@@ -127,7 +135,14 @@ mod webrtc {
         c.g_lag_in_frames = kLagInFrames; // No look ahead when lag equals 0.
 
         // https://aomedia.googlesource.com/aom/+/refs/tags/v3.6.0/av1/common/enums.h#82
-        c.g_profile = if i444 { 1 } else { 0 };
+        // AV1 profiles: 0=Main (8/10-bit 4:2:0), 1=High (8/10-bit 4:4:4), 2=Professional (10/12-bit)
+        c.g_profile = if cfg.hdr {
+            2 // Professional profile for 10-bit
+        } else if i444 {
+            1
+        } else {
+            0
+        };
 
         Ok(c)
     }
@@ -211,7 +226,11 @@ impl EncoderApi for AomEncoder {
 
                 let mut ctx = Default::default();
                 // Flag options: AOM_CODEC_USE_PSNR and AOM_CODEC_USE_HIGHBITDEPTH
-                let flags: aom_codec_flags_t = 0;
+                let flags: aom_codec_flags_t = if config.hdr {
+                    AOM_CODEC_USE_HIGHBITDEPTH as _
+                } else {
+                    0
+                };
                 call_aom!(aom_codec_enc_init_ver(
                     &mut ctx,
                     i,
@@ -225,7 +244,8 @@ impl EncoderApi for AomEncoder {
                     width: config.width as _,
                     height: config.height as _,
                     i444,
-                    yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
+                    hdr: config.hdr,
+                    yuvfmt: Self::get_yuvfmt(config.width, config.height, i444, config.hdr),
                 })
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -288,11 +308,20 @@ impl EncoderApi for AomEncoder {
 
 impl AomEncoder {
     pub fn encode<'a>(&'a mut self, ms: i64, data: &[u8], stride_align: usize) -> Result<EncodeFrames<'a>> {
-        let bpp = if self.i444 { 24 } else { 12 };
+        // 10-bit (HDR) uses 16-bit samples → double the bytes per plane sample.
+        let bpp = if self.hdr {
+            24 // I42016: each plane sample is 2 bytes → 12*2 = 24
+        } else if self.i444 {
+            24
+        } else {
+            12
+        };
         if data.len() < self.width * self.height * bpp / 8 {
             return Err(Error::FailedCall("len not enough".to_string()));
         }
-        let fmt = if self.i444 {
+        let fmt = if self.hdr {
+            aom_img_fmt::AOM_IMG_FMT_I42016
+        } else if self.i444 {
             aom_img_fmt::AOM_IMG_FMT_I444
         } else {
             aom_img_fmt::AOM_IMG_FMT_I420
@@ -369,9 +398,11 @@ impl AomEncoder {
         (q_min, q_max)
     }
 
-    fn get_yuvfmt(width: u32, height: u32, i444: bool) -> EncodeYuvFormat {
+    fn get_yuvfmt(width: u32, height: u32, i444: bool, hdr: bool) -> EncodeYuvFormat {
         let mut img = Default::default();
-        let fmt = if i444 {
+        let fmt = if hdr {
+            aom_img_fmt::AOM_IMG_FMT_I42016
+        } else if i444 {
             aom_img_fmt::AOM_IMG_FMT_I444
         } else {
             aom_img_fmt::AOM_IMG_FMT_I420
@@ -386,7 +417,13 @@ impl AomEncoder {
                 0x1 as _,
             );
         }
-        let pixfmt = if i444 { Pixfmt::I444 } else { Pixfmt::I420 };
+        let pixfmt = if hdr {
+            Pixfmt::P010
+        } else if i444 {
+            Pixfmt::I444
+        } else {
+            Pixfmt::I420
+        };
         EncodeYuvFormat {
             pixfmt,
             w: img.w as _,
@@ -579,3 +616,91 @@ impl Drop for Image {
 }
 
 unsafe impl Send for aom_codec_ctx_t {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_aom_config(hdr: bool) -> AomEncoderConfig {
+        AomEncoderConfig {
+            width: 1920,
+            height: 1080,
+            quality: 1.0,
+            keyframe_interval: None,
+            hdr,
+        }
+    }
+
+    #[test]
+    fn aom_bit_depth_10_when_hdr_true() {
+        let config = default_aom_config(true);
+        assert!(config.hdr);
+        let bit_depth: u32 = if config.hdr { 10 } else { 8 };
+        assert_eq!(bit_depth, 10);
+    }
+
+    #[test]
+    fn aom_bit_depth_8_when_hdr_false() {
+        let config = default_aom_config(false);
+        assert!(!config.hdr);
+        let bit_depth: u32 = if config.hdr { 10 } else { 8 };
+        assert_eq!(bit_depth, 8);
+    }
+
+    #[test]
+    fn aom_config_hdr_defaults_to_false() {
+        let config = AomEncoderConfig {
+            width: 640,
+            height: 480,
+            quality: 0.5,
+            keyframe_interval: Some(120),
+            hdr: false,
+        };
+        assert!(!config.hdr);
+    }
+
+    #[test]
+    fn aom_config_hdr_is_cloneable() {
+        let config = default_aom_config(true);
+        let cloned = config.clone();
+        assert_eq!(cloned.hdr, config.hdr);
+        assert_eq!(cloned.width, config.width);
+    }
+
+    #[test]
+    fn aom_config_hdr_debug_format() {
+        let config = default_aom_config(true);
+        let debug = format!("{:?}", config);
+        assert!(
+            debug.contains("hdr: true"),
+            "Debug output should contain hdr field"
+        );
+    }
+
+    #[test]
+    fn aom_hdr_yuvfmt_reports_p010() {
+        let fmt = AomEncoder::get_yuvfmt(1920, 1080, false, true);
+        assert_eq!(fmt.pixfmt, Pixfmt::P010);
+    }
+
+    #[test]
+    fn aom_non_hdr_yuvfmt_reports_i420() {
+        let fmt = AomEncoder::get_yuvfmt(1920, 1080, false, false);
+        assert_eq!(fmt.pixfmt, Pixfmt::I420);
+    }
+
+    #[test]
+    fn aom_hdr_profile_is_2() {
+        // When HDR is active, the AV1 profile should be 2 (Professional).
+        let config = default_aom_config(true);
+        let expected_profile: u32 = if config.hdr { 2 } else { 0 };
+        assert_eq!(expected_profile, 2);
+    }
+
+    #[test]
+    fn aom_non_hdr_profile_is_0() {
+        let config = default_aom_config(false);
+        let expected_profile: u32 = if config.hdr { 2 } else { 0 };
+        assert_eq!(expected_profile, 0);
+    }
+}

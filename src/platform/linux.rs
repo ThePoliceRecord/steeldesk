@@ -134,6 +134,18 @@ pub fn is_login_screen_wayland() -> bool {
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
 }
 
+/// Like `is_login_screen_wayland()` but catches panics from loginctl/D-Bus
+/// calls, returning `false` on any failure.
+///
+/// This is safe to call from contexts where panicking would be problematic
+/// (e.g., inside the DRM capture detection path in `gpu_pipeline.rs`).
+/// The underlying `get_values_of_seat0_with_gdm_wayland` calls loginctl
+/// which may fail in containers, minimal environments, or during shutdown.
+#[inline]
+pub fn is_login_screen_wayland_safe() -> bool {
+    std::panic::catch_unwind(is_login_screen_wayland).unwrap_or(false)
+}
+
 #[inline]
 fn sleep_millis(millis: u64) {
     std::thread::sleep(Duration::from_millis(millis));
@@ -2305,6 +2317,36 @@ mod desktop {
                 hbb_common::config::Config::get_option(hbb_common::config::keys::OPTION_ALLOW_LINUX_HEADLESS);
             let expected = option_val == "Y";
             assert_eq!(super::super::is_headless_allowed(), expected);
+        }
+
+        // -----------------------------------------------------------
+        // is_login_screen_wayland_safe()
+        // -----------------------------------------------------------
+
+        #[test]
+        fn test_is_login_screen_wayland_safe_returns_bool() {
+            // Must not panic regardless of environment (CI, container, desktop).
+            let _result = super::super::is_login_screen_wayland_safe();
+        }
+
+        #[test]
+        fn test_is_login_screen_wayland_safe_consistent() {
+            // If the non-safe version succeeds, both should agree.
+            // If the non-safe version panics, the safe version returns false.
+            let safe_result = super::super::is_login_screen_wayland_safe();
+            if let Ok(direct_result) =
+                std::panic::catch_unwind(super::super::is_login_screen_wayland)
+            {
+                assert_eq!(
+                    safe_result, direct_result,
+                    "safe and direct should agree when direct does not panic"
+                );
+            } else {
+                assert!(
+                    !safe_result,
+                    "safe should return false when direct panics"
+                );
+            }
         }
 
         // -----------------------------------------------------------

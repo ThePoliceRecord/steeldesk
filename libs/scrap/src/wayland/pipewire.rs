@@ -287,6 +287,38 @@ impl PipeWireRecorder {
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
         let mut caps = gst::Caps::new_empty();
+
+        // TODO(vaapi-zero-copy): When the VAAPI zero-copy pipeline is fully
+        // wired, add DMA-BUF NV12 caps here to negotiate zero-copy buffer
+        // sharing with PipeWire. This avoids the GPU->CPU copy that
+        // `always-copy=true` forces above.
+        //
+        // The caps would look like:
+        //
+        //   caps.merge_structure(gst::structure::Structure::new(
+        //       "video/x-raw",
+        //       &[
+        //           ("format", &"NV12"),
+        //       ],
+        //   ));
+        //   // Then set features on the structure for DMA-BUF memory:
+        //   // caps_features = gst::CapsFeatures::new(&["memory:DMABuf"]);
+        //   // caps.set_features(caps_idx, caps_features);
+        //
+        // With DMA-BUF negotiation, PipeWire will export frames as DMA-BUF
+        // file descriptors instead of copying pixel data to shared memory.
+        // The fd can then be extracted from the GstBuffer via:
+        //
+        //   let memory = buffer.peek_memory(0);
+        //   let fd_mem = memory.downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>();
+        //   let fd = fd_mem.fd();
+        //
+        // And wrapped in a DmaBufFrame for import into VAAPI.
+        //
+        // Additionally, `always-copy=true` (set above on pipewiresrc) must be
+        // removed or set to false for the DMA-BUF path, since it forces a CPU
+        // copy that defeats the purpose of zero-copy.
+
         caps.merge_structure(gst::structure::Structure::new(
             "video/x-raw",
             &[("format", &"BGRx")],

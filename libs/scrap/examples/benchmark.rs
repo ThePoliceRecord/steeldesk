@@ -95,6 +95,7 @@ fn test_vpx(
         quality,
         codec: codec_id,
         keyframe_interval: None,
+        hdr: false,
     });
     let mut encoder = VpxEncoder::new(config, i444).unwrap();
     let mut vpxs = vec![];
@@ -173,6 +174,7 @@ fn test_av1(
         height: height as _,
         quality,
         keyframe_interval: None,
+        hdr: false,
     });
     let mut encoder = AomEncoder::new(config, i444).unwrap();
     let start = Instant::now();

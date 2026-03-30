@@ -616,6 +616,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 quality,
                 codec: VpxVideoCodecId::VP9,
                 keyframe_interval: None,
+                hdr: scrap::is_display_hdr(),
             }));
             setup_encoder(
                 &c,
@@ -1096,6 +1097,7 @@ fn get_encoder_config(
                 quality,
                 codec: VpxVideoCodecId::VP9,
                 keyframe_interval,
+                hdr: scrap::is_display_hdr(),
             })
         }
         format @ (CodecFormat::VP8 | CodecFormat::VP9) => EncoderCfg::VPX(VpxEncoderConfig {
@@ -1108,12 +1110,14 @@ fn get_encoder_config(
                 VpxVideoCodecId::VP9
             },
             keyframe_interval,
+            hdr: scrap::is_display_hdr(),
         }),
         CodecFormat::AV1 => EncoderCfg::AOM(AomEncoderConfig {
             width: c.width as _,
             height: c.height as _,
             quality,
             keyframe_interval,
+            hdr: scrap::is_display_hdr(),
         }),
         _ => EncoderCfg::VPX(VpxEncoderConfig {
             width: c.width as _,
@@ -1121,6 +1125,7 @@ fn get_encoder_config(
             quality,
             codec: VpxVideoCodecId::VP9,
             keyframe_interval,
+            hdr: scrap::is_display_hdr(),
         }),
     }
 }
