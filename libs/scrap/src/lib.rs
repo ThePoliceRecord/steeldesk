@@ -23,4 +23,6 @@ pub mod dxgi;
 #[cfg(target_os = "android")]
 pub mod android;
 
+pub mod dxgi_hdr_constants;
+
 mod common;

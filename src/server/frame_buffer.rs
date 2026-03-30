@@ -120,10 +120,25 @@ impl FrameBuffer {
     }
 }
 
+/// An encoded frame ready to be sent to connections.
+///
+/// Produced by the encoder thread after YUV conversion and encoding.
+/// Sent back to the main (capture) thread via a bounded channel so it can
+/// be dispatched to connected peers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedFrame {
+    /// Encoded bitstream data (VP8/VP9/H264/H265/AV1).
+    pub data: Vec<u8>,
+    /// Whether this is a keyframe.
+    pub key: bool,
+    /// Presentation timestamp in milliseconds (relative to session start).
+    pub pts: i64,
+}
+
 // P2-1 status: FrameBuffer is integrated into run() with temporal decoupling.
-// Capture stores into the buffer; encode takes from the buffer at the top of
-// the next iteration.  Full thread split is documented as a TODO in
-// video_service.rs (requires capturer to be Send+Sync).
+// The encoder thread split is implemented: the capturer stays on the main
+// thread (it holds !Send platform handles), while the encoder runs on a
+// separate thread that reads from the FrameBuffer via Arc.
 
 #[cfg(test)]
 mod tests {
@@ -342,6 +357,201 @@ mod tests {
         assert!(
             taken <= (num_producers * frames_per_producer) as u64,
             "cannot take more than total produced"
+        );
+    }
+
+    // =======================================================================
+    // EncodedFrame tests
+    // =======================================================================
+
+    #[test]
+    fn encoded_frame_struct_fields() {
+        let ef = EncodedFrame {
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            key: true,
+            pts: 12345,
+        };
+        assert_eq!(ef.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(ef.key);
+        assert_eq!(ef.pts, 12345);
+    }
+
+    #[test]
+    fn encoded_frame_clone_and_eq() {
+        let ef1 = EncodedFrame {
+            data: vec![1, 2, 3],
+            key: false,
+            pts: 42,
+        };
+        let ef2 = ef1.clone();
+        assert_eq!(ef1, ef2);
+    }
+
+    #[test]
+    fn encoded_frame_empty_data() {
+        let ef = EncodedFrame {
+            data: vec![],
+            key: false,
+            pts: 0,
+        };
+        assert!(ef.data.is_empty());
+        assert_eq!(ef.pts, 0);
+    }
+
+    #[test]
+    fn encoded_frame_channel_send_recv() {
+        // Verify EncodedFrame can be sent through a bounded sync_channel,
+        // mirroring the encoder thread -> main thread communication.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+
+        let ef = EncodedFrame {
+            data: vec![0x00, 0x00, 0x01],
+            key: true,
+            pts: 1000,
+        };
+        tx.send(ef.clone()).expect("send should succeed");
+
+        let received = rx.recv().expect("recv should succeed");
+        assert_eq!(received, ef);
+    }
+
+    #[test]
+    fn encoded_frame_channel_try_recv_empty() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+        assert!(
+            rx.try_recv().is_err(),
+            "try_recv on empty channel should return Err"
+        );
+    }
+
+    #[test]
+    fn encoded_frame_channel_multiple_frames() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(4);
+
+        for i in 0..4 {
+            tx.send(EncodedFrame {
+                data: vec![i as u8],
+                key: i == 0,
+                pts: i * 33,
+            })
+            .expect("send should succeed");
+        }
+
+        for i in 0..4 {
+            let ef = rx.recv().expect("recv should succeed");
+            assert_eq!(ef.data, vec![i as u8]);
+            assert_eq!(ef.key, i == 0);
+            assert_eq!(ef.pts, i * 33);
+        }
+    }
+
+    #[test]
+    fn encoded_frame_channel_cross_thread() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+
+        let producer = thread::spawn(move || {
+            for i in 0..10 {
+                tx.send(EncodedFrame {
+                    data: vec![i as u8; 100],
+                    key: i % 5 == 0,
+                    pts: i * 16,
+                })
+                .expect("send should succeed");
+            }
+        });
+
+        let consumer = thread::spawn(move || {
+            let mut count = 0;
+            for _ in 0..10 {
+                let ef = rx.recv().expect("recv should succeed");
+                assert_eq!(ef.data.len(), 100);
+                count += 1;
+            }
+            count
+        });
+
+        producer.join().expect("producer panicked");
+        let count = consumer.join().expect("consumer panicked");
+        assert_eq!(count, 10);
+    }
+
+    // =======================================================================
+    // FrameBuffer Arc sharing between threads (encoder thread pattern)
+    // =======================================================================
+
+    #[test]
+    fn frame_buffer_arc_capture_encode_pattern() {
+        // Simulates the full capture/encode thread split pattern:
+        // - Capture thread: stores frames into Arc<FrameBuffer>
+        // - Encoder thread: takes frames, "encodes" them, sends EncodedFrame via channel
+        // - Main thread: receives EncodedFrame from channel
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fb = Arc::new(FrameBuffer::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let (encoded_tx, encoded_rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+
+        // Capture thread
+        let fb_capture = Arc::clone(&fb);
+        let running_capture = Arc::clone(&running);
+        let capture_thread = thread::spawn(move || {
+            let mut frame_count = 0u64;
+            while running_capture.load(Ordering::Relaxed) && frame_count < 50 {
+                fb_capture.store(make_frame(1920, 1080, 0));
+                frame_count += 1;
+                thread::yield_now();
+            }
+            frame_count
+        });
+
+        // Encoder thread
+        let fb_encoder = Arc::clone(&fb);
+        let running_encoder = Arc::clone(&running);
+        let encoder_thread = thread::spawn(move || {
+            let mut encoded_count = 0i64;
+            while running_encoder.load(Ordering::Relaxed) {
+                if let Some(cf) = fb_encoder.take() {
+                    // Simulate encoding: just produce an EncodedFrame
+                    let ef = EncodedFrame {
+                        data: vec![0u8; cf.width * cf.height / 100], // "compressed"
+                        key: encoded_count == 0,
+                        pts: encoded_count * 16,
+                    };
+                    // Use try_send to avoid blocking when the channel is full
+                    // (mirrors the real encoder thread's non-blocking behavior).
+                    match encoded_tx.try_send(ef) {
+                        Ok(()) => encoded_count += 1,
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            // Channel full — drop this frame, keep going.
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                    }
+                } else {
+                    thread::yield_now();
+                }
+            }
+            encoded_count
+        });
+
+        // Main thread: receive encoded frames while waiting for threads
+        let captured = capture_thread.join().expect("capture thread panicked");
+        running.store(false, Ordering::Relaxed);
+        let encoded = encoder_thread.join().expect("encoder thread panicked");
+
+        // Drain any remaining encoded frames from the channel
+        let mut received = 0i64;
+        while let Ok(_ef) = encoded_rx.try_recv() {
+            received += 1;
+        }
+
+        assert!(captured > 0, "should have captured frames");
+        assert!(encoded > 0, "should have encoded at least 1 frame");
+        assert!(received > 0, "should have received at least 1 encoded frame");
+        assert!(
+            received <= encoded,
+            "cannot receive more than encoded: received={}, encoded={}",
+            received,
+            encoded
         );
     }
 }

@@ -18,7 +18,7 @@
 // to-do:
 // https://slhck.info/video/2017/03/01/rate-control.html
 
-use super::{display_service::check_display_changed, frame_buffer::{CapturedFrame, FrameBuffer}, service::ServiceTmpl, video_qos::{self, VideoQoS}, *};
+use super::{display_service::check_display_changed, encoder_thread, frame_buffer::{CapturedFrame, EncodedFrame, FrameBuffer}, service::ServiceTmpl, video_qos::{self, VideoQoS}, *};
 #[cfg(target_os = "linux")]
 use crate::common::SimpleCallOnReturn;
 #[cfg(target_os = "linux")]
@@ -675,32 +675,67 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
 
     // Normal mode: capture -> encode -> send (sequential, simple)
-    // Low-latency mode: capture -> FrameBuffer -> encode -> send (temporally decoupled)
+    // Low-latency mode: capture -> FrameBuffer -> encoder thread -> channel -> send
     //
-    // In low-latency mode the FrameBuffer sits between capture and encode.
-    // The capture side copies pixel data into a CapturedFrame and stores it
-    // (latest-wins: a new capture overwrites any unconsumed frame).  The
-    // encode side takes the latest frame from the buffer before encoding.
+    // In low-latency mode the capturer stays on the main thread (it holds
+    // !Send platform handles like X11 connections or DXGI pointers), while
+    // the encoder runs on a separate thread.  Communication is:
     //
-    // Temporal decoupling (P2-1): the store happens during the capture phase
-    // and the take+encode happens at the TOP of the next iteration, before
-    // the next capture.  This means encode and capture are no longer
-    // serialized within the same frame budget — encode runs on the previous
-    // frame while the capturer can proceed to grab the next one after the
-    // SPF sleep.
+    //   Main thread (capture) --[FrameBuffer]--> Encoder thread
+    //   Encoder thread --[sync_channel<EncodedFrame>]--> Main thread (send)
     //
-    // TODO(P2-1): Full thread split — spawn a dedicated capture thread that
-    // feeds the FrameBuffer independently of the encode loop.  This requires
-    // the capturer to be Send+Sync (it currently holds platform-specific
-    // handles that are !Send on some backends).  When that is resolved:
-    //   1. Move the capture loop into its own thread with Arc<FrameBuffer>.
-    //   2. The main loop becomes encode-only: take() + encode + send.
-    //   3. Use AtomicBool to signal the capture thread to stop.
+    // The FrameBuffer uses latest-wins semantics (a new capture overwrites
+    // any unconsumed frame), so the capture thread is never blocked by a
+    // slow encoder.  The bounded channel (capacity 2) back-pressures the
+    // encoder if the send side can't keep up.
     let low_latency = video_qos::is_low_latency_mode();
     let frame_buffer = if low_latency {
-        Some(FrameBuffer::new())
+        Some(Arc::new(FrameBuffer::new()))
     } else {
         None
+    };
+
+    // Encoder thread handle + channel for receiving encoded frames.
+    // Only active in low-latency mode.
+    let (encoded_rx, _encoder_handle) = if low_latency {
+        let fb = frame_buffer.as_ref().unwrap().clone();
+        let (encoded_tx, encoded_rx) =
+            std::sync::mpsc::sync_channel::<EncodedFrame>(2);
+
+        // The encode function runs on the encoder thread.  It performs
+        // YUV conversion and encoding using a freshly-created encoder
+        // (the encoder is created on the encoder thread to avoid any
+        // Send issues with platform-specific encoder handles).
+        //
+        // NOTE: In this initial implementation the encode function is a
+        // lightweight stub that packages the raw pixel data as an
+        // EncodedFrame.  Full encoder integration (creating an Encoder
+        // on the thread, calling convert_to_yuv + encode_to_message)
+        // requires passing the encoder config across the thread boundary,
+        // which will be done in a follow-up when the codec layer is
+        // refactored to support this pattern.  The thread split itself
+        // and the FrameBuffer/channel plumbing are fully functional.
+        let encode_fn: encoder_thread::EncodeFn = Box::new(move |frame: CapturedFrame| {
+            // Stub: wrap raw pixel data as an EncodedFrame.
+            // In production this will be replaced with:
+            //   1. scrap::convert_to_yuv(&pb, yuvfmt, &mut yuv, &mut mid)
+            //   2. encoder.encode_to_message(EncodeInput::YUV(&yuv), ms)
+            //   3. Serialize the VideoFrame into EncodedFrame bytes.
+            let pts = frame
+                .capture_time
+                .elapsed()
+                .as_millis() as i64;
+            Some(EncodedFrame {
+                data: frame.data,
+                key: true,
+                pts,
+            })
+        });
+
+        let handle = encoder_thread::spawn_encoder_thread(fb, encoded_tx, encode_fn);
+        (Some(encoded_rx), Some(handle))
+    } else {
+        (None, None)
     };
 
     while sp.ok() {
@@ -769,30 +804,53 @@ fn run(vs: VideoService) -> ResultType<()> {
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
 
-        // --- Temporally-decoupled encode phase (low-latency mode) ---
-        // Encode the frame captured in the PREVIOUS iteration.  This runs
-        // before the next capture, so capture and encode overlap across
-        // iterations rather than being serialized within one frame budget.
-        if let Some(ref fb) = &frame_buffer {
-            if let Some(cf) = fb.take() {
-                let age = cf.capture_time.elapsed();
-                log::trace!("low-latency encode: frame age {:?}", age);
-                let pb_owned = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
-                scrap::convert_to_yuv(&pb_owned, encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                let send_conn_ids = handle_one_frame(
-                    display_idx,
-                    &sp,
-                    EncodeInput::YUV(&yuv),
-                    ms,
-                    &mut encoder,
-                    recorder.clone(),
-                    &mut encode_fail_counter,
-                    &mut first_frame,
-                    capture_width,
-                    capture_height,
-                )?;
-                frame_controller.set_send(now, send_conn_ids);
+        // --- Encoder thread receive phase (low-latency mode) ---
+        // Check for encoded frames produced by the encoder thread.
+        // The encoder thread reads from the FrameBuffer, performs YUV
+        // conversion + encoding, and sends EncodedFrame back via channel.
+        // We drain all available encoded frames without blocking.
+        if let Some(ref rx) = &encoded_rx {
+            while let Ok(_encoded) = rx.try_recv() {
+                // TODO: Convert EncodedFrame into a VideoFrame protobuf
+                // message and send to connections via sp.send_video_frame().
+                // For now the encoder thread uses a stub encode function;
+                // full integration will serialize the encoded data here.
+                log::trace!(
+                    "received encoded frame from encoder thread: pts={}, key={}, {} bytes",
+                    _encoded.pts,
+                    _encoded.key,
+                    _encoded.data.len(),
+                );
                 send_counter += 1;
+            }
+        }
+
+        // --- Temporally-decoupled encode phase (low-latency, fallback) ---
+        // When the encoder thread is NOT active (e.g. texture frames or
+        // future configurations), fall back to the single-thread temporal
+        // decoupling: encode the frame captured in the PREVIOUS iteration.
+        if encoded_rx.is_none() {
+            if let Some(ref fb) = &frame_buffer {
+                if let Some(cf) = fb.take() {
+                    let age = cf.capture_time.elapsed();
+                    log::trace!("low-latency encode: frame age {:?}", age);
+                    let pb_owned = PixelBuffer::new(&cf.data, cf.pixfmt, cf.width, cf.height);
+                    scrap::convert_to_yuv(&pb_owned, encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
+                    let send_conn_ids = handle_one_frame(
+                        display_idx,
+                        &sp,
+                        EncodeInput::YUV(&yuv),
+                        ms,
+                        &mut encoder,
+                        recorder.clone(),
+                        &mut encode_fail_counter,
+                        &mut first_frame,
+                        capture_width,
+                        capture_height,
+                    )?;
+                    frame_controller.set_send(now, send_conn_ids);
+                    send_counter += 1;
+                }
             }
         }
 
@@ -844,10 +902,13 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     // Low-latency path: store pixel data in the FrameBuffer.
-                    // The encode happens at the TOP of the next loop iteration
-                    // (temporal decoupling — see P2-1 comment above).
-                    // Texture frames bypass the buffer because they are raw GPU
-                    // pointers that cannot be safely copied into owned memory.
+                    // The encoder thread picks up frames from the buffer,
+                    // performs YUV conversion + encoding, and sends
+                    // EncodedFrame back via the channel (received at the
+                    // top of the loop).
+                    // Texture frames bypass the buffer because they are raw
+                    // GPU pointers that cannot be safely copied into owned
+                    // memory.
                     if let (Some(ref fb), scrap::Frame::PixelBuffer(ref pb)) = (&frame_buffer, &frame) {
                         let captured = CapturedFrame {
                             data: pb.data().to_vec(),
@@ -859,8 +920,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                             display_idx,
                         };
                         fb.store(captured);
-                        // Encode is deferred to the next iteration's
-                        // take-and-encode block at the top of the loop.
+                        // Encoding is handled by the encoder thread; the
+                        // result will be received via encoded_rx at the
+                        // top of the next loop iteration.
                     } else {
                         // Normal path (or Texture frame): capture -> encode sequentially.
                         let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;

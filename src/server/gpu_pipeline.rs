@@ -156,6 +156,96 @@
 //   - Add Frame::DmaBuf variant (parallel to Frame::Texture on Windows)
 //   - Feature-gate behind "vram" on Linux
 
+/// Attempt a full VAAPI zero-copy encode of a DMA-BUF frame.
+///
+/// This is the top-level entry point for the zero-copy encode pipeline:
+///
+/// 1. Load `libva.so.2` via `dlopen` (cached after first call).
+/// 2. Import the DMA-BUF fd into a VA surface (zero-copy bind).
+/// 3. Encode the surface via the VAAPI H.264/H.265 encode pipeline.
+/// 4. Return the encoded bitstream (NALUs).
+///
+/// # Current status
+///
+/// Steps 1 and 2 are implemented.  Step 3 (the actual encode) is stubbed —
+/// it requires setting up a full VA encode context with rate-control and
+/// sequence/picture/slice parameter buffers, which will be wired when the
+/// pipeline is integrated with `hwcodec` or a standalone encode path.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `libva` is not installed on the system.
+/// - The DMA-BUF fd or format is invalid.
+/// - VAAPI surface creation fails (driver issue, unsupported format, etc.).
+/// - The encode step fails or is not yet implemented.
+#[cfg(target_os = "linux")]
+pub fn try_vaapi_encode(dmabuf: &scrap::DmaBufFrame) -> Result<Vec<u8>, String> {
+    use scrap::vaapi;
+
+    // Step 1: Load VAAPI library.
+    let _lib = vaapi::vaapi_lib()
+        .ok_or_else(|| "libva.so not available on this system".to_string())?;
+
+    // Step 2: Open a DRM render node and get a VADisplay.
+    // In the full pipeline this would be cached per-session, not opened
+    // per-frame.  For now we document the expected flow.
+    let device_path = vaapi_device_path()
+        .ok_or_else(|| "no DRI render node found".to_string())?;
+
+    // TODO: Open the render node fd and call vaGetDisplayDRM().
+    // This requires libva-drm.so (vaGetDisplayDRM) which we should also
+    // dlopen.  For now, return a clear error indicating what's missing.
+    //
+    // let drm_fd = libc::open(device_path.as_ptr(), libc::O_RDWR);
+    // let display = vaGetDisplayDRM(drm_fd);
+    // let mut major = 0i32;
+    // let mut minor = 0i32;
+    // (lib.va_initialize)(display, &mut major, &mut minor);
+    //
+    // Step 3: Import DMA-BUF to surface.
+    // let surface = vaapi::import_dmabuf_to_surface(lib, display, dmabuf)?;
+    //
+    // Step 4: Encode via VAAPI.
+    // - vaCreateConfig(profile, entrypoint)
+    // - vaCreateContext(config, width, height, surfaces)
+    // - vaCreateBuffer (sequence params, picture params, slice params)
+    // - vaBeginPicture / vaRenderPicture / vaEndPicture
+    // - vaSyncSurface
+    // - vaMapBuffer (coded buffer) -> extract NALUs
+    // - vaUnmapBuffer / vaDestroyBuffer / vaDestroySurfaces
+    //
+    // Step 5: Clean up.
+    // - vaDestroyContext / vaDestroyConfig / vaTerminate
+
+    Err(format!(
+        "VAAPI encode pipeline not yet fully wired \
+         (libva loaded, render node={}, dmabuf {}x{} fd={}). \
+         The surface import and encode steps require vaGetDisplayDRM \
+         from libva-drm.so which is not yet integrated.",
+        device_path, dmabuf.width, dmabuf.height, dmabuf.fd,
+    ))
+}
+
+/// Check whether the VAAPI runtime library (`libva.so.2`) can be loaded.
+///
+/// Unlike [`vaapi_available`] which only checks for DRI render nodes on the
+/// filesystem, this function actually attempts to `dlopen` the library and
+/// resolve all required symbols.  Returns `true` only if the full VAAPI
+/// function-pointer table was successfully loaded.
+///
+/// This is a stronger check: a system can have render nodes but no VAAPI
+/// driver installed (e.g. Nouveau without `mesa-va-drivers`).
+#[cfg(target_os = "linux")]
+pub fn vaapi_runtime_available() -> bool {
+    scrap::vaapi::vaapi_lib().is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn vaapi_runtime_available() -> bool {
+    false
+}
+
 /// Check whether VAAPI zero-copy encoding is potentially available.
 ///
 /// This performs a lightweight filesystem check for DRI render nodes
@@ -765,5 +855,92 @@ mod tests {
             GpuPipelineMode::VaapiZeroCopy => {} // expected
             _ => panic!("should match VaapiZeroCopy"),
         }
+    }
+
+    // -- VAAPI runtime detection tests --------------------------------------
+
+    #[test]
+    fn vaapi_runtime_available_returns_bool() {
+        // Must not panic regardless of whether libva is installed.
+        let _available = vaapi_runtime_available();
+    }
+
+    #[test]
+    fn vaapi_runtime_consistent_with_filesystem_check() {
+        // If runtime is available, the filesystem check must also pass
+        // (you need both render nodes AND libva).
+        if vaapi_runtime_available() {
+            assert!(
+                vaapi_available(),
+                "if libva loads, render nodes must exist"
+            );
+        }
+    }
+
+    // -- VAAPI encode stub tests --------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_vaapi_encode_returns_descriptive_error() {
+        // The encode pipeline is not fully wired, so this should return
+        // an Err with useful diagnostic info (not panic).
+        let dmabuf = scrap::DmaBufFrame {
+            fd: 99,
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+            offset: 0,
+            format: scrap::DmaBufFrame::DRM_FORMAT_NV12,
+            modifier: scrap::DmaBufFrame::DRM_FORMAT_MOD_LINEAR,
+        };
+        let result = try_vaapi_encode(&dmabuf);
+        assert!(result.is_err(), "encode pipeline should not succeed yet");
+        let err = result.unwrap_err();
+        // The error should mention either "not available" or "not yet wired"
+        assert!(
+            err.contains("not") || err.contains("libva"),
+            "error should be descriptive, got: {}",
+            err
+        );
+    }
+
+    // -- VAAPI module tests (via scrap re-export) ---------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_lib_load_does_not_panic() {
+        let _ = scrap::vaapi::VaapiLib::load();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_constants_match_drm_constants() {
+        // The VA fourcc for NV12 must match the DRM fourcc — they are
+        // the same value by design.
+        assert_eq!(
+            scrap::vaapi::VA_FOURCC_NV12,
+            scrap::DmaBufFrame::DRM_FORMAT_NV12,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_drm_format_mapping_round_trip() {
+        use scrap::vaapi::*;
+        // NV12 -> VA_RT_FORMAT_YUV420
+        assert_eq!(
+            drm_format_to_va_rt(scrap::DmaBufFrame::DRM_FORMAT_NV12),
+            Some(VA_RT_FORMAT_YUV420),
+        );
+        // NV12 -> VA_FOURCC_NV12
+        assert_eq!(
+            drm_format_to_va_fourcc(scrap::DmaBufFrame::DRM_FORMAT_NV12),
+            Some(VA_FOURCC_NV12),
+        );
+        // P010 -> VA_RT_FORMAT_YUV420_10
+        assert_eq!(
+            drm_format_to_va_rt(DRM_FORMAT_P010),
+            Some(VA_RT_FORMAT_YUV420_10),
+        );
     }
 }

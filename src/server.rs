@@ -76,6 +76,7 @@ pub mod portable_service;
 mod service;
 pub mod video_qos;
 pub mod frame_buffer;
+pub mod encoder_thread;
 pub mod video_service;
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]

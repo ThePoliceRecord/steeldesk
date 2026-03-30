@@ -1,6 +1,7 @@
 use std::{io, mem, ptr, slice};
 pub mod gdi;
 pub use gdi::CapturerGDI;
+pub mod hdr;
 pub mod mag;
 
 use winapi::{

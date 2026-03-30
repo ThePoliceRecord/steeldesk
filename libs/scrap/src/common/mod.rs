@@ -53,6 +53,8 @@ pub mod aom;
 #[cfg(not(any(target_os = "ios")))]
 pub mod camera;
 pub mod record;
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 mod vpx;
 
 #[repr(usize)]
@@ -691,11 +693,33 @@ pub fn is_display_hdr() -> bool {
 
 /// Detect whether the current display supports HDR.
 ///
-/// On non-macOS platforms this checks only the `STEELDESK_HDR` environment
-/// variable (`"1"` to force-enable).  Real per-platform detection (DXGI 1.6
-/// on Windows, Wayland color-management on Linux) will be added later.
+/// # Windows (DXGI 1.6)
+///
+/// On Windows, real detection is available via `dxgi::hdr::win::query_hdr_output_info()`,
+/// which calls `IDXGIOutput6::GetDesc1()` and checks whether the output's color
+/// space is `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (BT.2020 + PQ).  That
+/// query requires an active `IDXGIOutput1` pointer, so it is performed during
+/// display enumeration in `dxgi::Capturer::new()` rather than here.
+///
+/// This function serves as the cheap, global fallback: it checks the
+/// `STEELDESK_HDR` environment variable (`"1"` to force-enable) so the
+/// feature can be tested without Windows hardware.  When real DXGI 1.6
+/// detection is wired into the capture loop, callers should prefer the
+/// per-output result from `query_hdr_output_info`.
+///
+/// # Linux
+///
+/// Real detection via Wayland `wp_color_management_v1` will be added later.
+/// For now, only the env-var toggle is available.
 #[cfg(not(target_os = "macos"))]
 pub fn is_display_hdr() -> bool {
+    // On Windows, the DXGI 1.6 path (dxgi::hdr::win) provides per-output HDR
+    // detection.  This global check is a convenient override / fallback.
+    #[cfg(windows)]
+    {
+        // Future: cache result from dxgi::hdr::win::query_hdr_output_info()
+        // and return it here so callers don't need a Display reference.
+    }
     std::env::var("STEELDESK_HDR").unwrap_or_default() == "1"
 }
 
