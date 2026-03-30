@@ -36,6 +36,7 @@
 
           buildInputs = with pkgs; [
             # From nixpkgs rustdesk package.nix
+            ffmpeg
             atk
             bzip2
             cairo

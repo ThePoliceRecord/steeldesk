@@ -4,13 +4,11 @@ use async_trait::async_trait;
 use hbb_common::{
     config::PeerConfig,
     config::READ_TIMEOUT,
-    futures::{SinkExt, StreamExt},
     log,
     message_proto::*,
     protobuf::Message as _,
     rendezvous_proto::ConnType,
     tokio::{self, sync::mpsc},
-    Stream,
 };
 use std::sync::{Arc, RwLock};
 
@@ -41,6 +39,7 @@ impl Session {
             false,
             None,
             None,
+            None,
         );
         session
     }
@@ -48,22 +47,34 @@ impl Session {
 
 #[async_trait]
 impl Interface for Session {
-    fn get_login_config_handler(&self) -> Arc<RwLock<LoginConfigHandler>> {
+    fn get_lch(&self) -> Arc<RwLock<LoginConfigHandler>> {
         return self.lc.clone();
     }
+
+    fn set_multiple_windows_session(&self, _sessions: Vec<WindowsSession>) {}
 
     fn msgbox(&self, msgtype: &str, title: &str, text: &str, link: &str) {
         match msgtype {
             "input-password" => {
                 self.sender
-                    .send(Data::Login((self.password.clone(), true)))
+                    .send(Data::Login((
+                        "".to_owned(),
+                        self.password.clone(),
+                        "".to_owned(),
+                        true,
+                    )))
                     .ok();
             }
             "re-input-password" => {
                 log::error!("{}: {}", title, text);
                 match rpassword::prompt_password("Enter password: ") {
                     Ok(password) => {
-                        let login_data = Data::Login((password, true));
+                        let login_data = Data::Login((
+                            "".to_owned(),
+                            password,
+                            "".to_owned(),
+                            true,
+                        ));
                         self.sender.send(login_data).ok();
                     }
                     Err(e) => {
@@ -132,12 +143,11 @@ pub async fn connect_test(id: &str, key: String, token: String) {
         Err(err) => {
             log::error!("Failed to connect {}: {}", &id, err);
         }
-        Ok((mut stream, direct)) => {
-            log::info!("direct: {}", direct);
-            // rpassword::prompt_password("Input anything to exit").ok();
+        Ok(((mut transport, direct, _pk, _kcp, _relay), (latency, relay_server))) => {
+            log::info!("direct: {}, latency: {}, relay: {}", direct, latency, relay_server);
             loop {
                 tokio::select! {
-                    res = hbb_common::timeout(READ_TIMEOUT, stream.next()) => match res {
+                    res = hbb_common::timeout(READ_TIMEOUT, transport.next()) => match res {
                         Err(_) => {
                             log::error!("Timeout");
                             break;

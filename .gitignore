@@ -61,3 +61,4 @@ flake.lock
 
 # Benchmarks
 target/criterion/
+.github/workflows/audit.yml
