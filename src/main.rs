@@ -35,6 +35,21 @@ fn main() {
 
 #[cfg(feature = "cli")]
 fn main() {
+    // Handle internal subprocess args before clap (they aren't user-facing CLI args)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        match args[0].as_str() {
+            "--check-hwcodec-config" => {
+                #[cfg(feature = "hwcodec")]
+                crate::ipc::hwcodec_process();
+                return;
+            }
+            "--terminal-helper" => {
+                return; // Windows only
+            }
+            _ => {}
+        }
+    }
     if !common::global_init() {
         return;
     }
