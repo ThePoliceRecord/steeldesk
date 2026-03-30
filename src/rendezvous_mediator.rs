@@ -343,20 +343,41 @@ impl RendezvousMediator {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         // QUIC transport integration point.
-        // When fully wired, this is where the rendezvous connection to the
-        // server could use QUIC instead of TCP. The returned `conn` (a
-        // `Stream`) would need to be replaced with a QUIC-backed equivalent.
+        //
+        // When `should_use_quic()` returns true, we attempt a QUIC connection
+        // to the rendezvous server before falling back to TCP. The rendezvous
+        // server's certificate would ideally be pinned or distributed via DNS,
+        // but for now we pass an empty cert (which causes the QUIC attempt to
+        // be skipped gracefully).
         //
         // Integration sites in rendezvous_mediator.rs:
         //   1. start_tcp() — rendezvous server connection (here)
         //   2. create_relay() — relay signaling via connect_tcp()
         //   3. handle_punch_hole() — TCP hole-punch via connect_tcp()
-        if crate::transport::should_use_quic() {
-            log::info!(
-                "QUIC transport preferred for rendezvous server '{}' — \
-                 integration pending, will use TCP",
-                host,
-            );
+        //
+        // Full integration TODO:
+        //   The rendezvous protocol uses `Stream` (TCP/WebSocket) for
+        //   message framing. To use QUIC here, `Stream::Quic` must be
+        //   added so the `conn.next()` / `conn.send()` loop below works
+        //   transparently over QUIC.
+        #[cfg(feature = "quic-transport")]
+        {
+            let quic_result = crate::transport::try_quic_connection(&host, &[]).await;
+            if quic_result.attempted {
+                if quic_result.quic_transport.is_some() {
+                    log::info!(
+                        "QUIC probe to rendezvous server {} succeeded — session will use \
+                         TCP until Stream::Quic is implemented",
+                        host,
+                    );
+                } else {
+                    log::debug!(
+                        "QUIC probe to rendezvous server {} skipped/failed: {}",
+                        host,
+                        quic_result.reason,
+                    );
+                }
+            }
         }
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
@@ -468,6 +489,27 @@ impl RendezvousMediator {
             uuid,
             secure,
         );
+
+        // Attempt QUIC for relay signaling connection.
+        #[cfg(feature = "quic-transport")]
+        {
+            let quic_result = crate::transport::try_quic_connection(&self.host, &[]).await;
+            if quic_result.attempted {
+                if quic_result.quic_transport.is_some() {
+                    log::info!(
+                        "QUIC probe to relay signaling {} succeeded — using TCP until \
+                         Stream::Quic is implemented",
+                        self.host,
+                    );
+                } else {
+                    log::debug!(
+                        "QUIC probe to relay signaling {} skipped/failed: {}",
+                        self.host,
+                        quic_result.reason,
+                    );
+                }
+            }
+        }
 
         let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
 

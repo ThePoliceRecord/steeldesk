@@ -295,30 +295,56 @@ impl Client {
             bail!("Incoming only mode");
         }
         // QUIC transport integration point.
-        // When fully wired, this is where we would attempt a QUIC connection
-        // before falling back to TCP for direct IP/domain connections below.
+        //
+        // When `should_use_quic()` returns true (feature compiled in + config
+        // option set), we attempt a QUIC connection first for direct IP and
+        // domain connections. On failure, we fall back to TCP transparently.
         //
         // Integration sites in this function:
-        //   1. Direct IP connection (hbb_common::is_ip_str branch) — connect_tcp_local()
-        //   2. Direct domain connection (hbb_common::is_domain_port_str branch) — connect_tcp_local()
+        //   1. Direct IP connection (hbb_common::is_ip_str branch) — QUIC then TCP
+        //   2. Direct domain connection (hbb_common::is_domain_port_str branch) — QUIC then TCP
         //   3. NAT-traversed peer connection — connect_tcp_local() in connect_futures
-        //   4. Relay connection — Self::create_relay() → connect_tcp()
+        //      (QUIC not yet wired here; requires cert from rendezvous)
+        //   4. Relay connection — Self::create_relay() → QUIC then TCP
         //
-        // Each site returns a `Stream` (TCP). The QUIC path would return a
-        // QuicTransport wrapped in a Stream-compatible adapter instead.
-        if crate::transport::should_use_quic() {
-            log::info!(
-                "QUIC transport preferred for peer '{}' — \
-                 integration pending, will use TCP",
-                peer,
-            );
-        }
+        // Full session integration TODO:
+        //   The session currently operates on `hbb_common::Stream` (TCP/WebSocket enum).
+        //   To use QUIC end-to-end, `Stream` needs a `Quic` variant wrapping the
+        //   QUIC bidirectional control stream with the same send/next/send_bytes
+        //   interface. Until that refactor, a successful QUIC handshake validates
+        //   connectivity but the session data path still uses TCP. The QUIC
+        //   transport is dropped after the probe.
+
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
+            let addr = check_port(peer, RELAY_PORT + 1);
+            // Attempt QUIC for direct IP connections.
+            // peer_pk is empty here (no rendezvous exchange for direct IP),
+            // so the QUIC attempt will be skipped until we have a certificate
+            // exchange mechanism for direct connections.
+            // TODO: For direct IP, the peer could expose its cert via a
+            // side-channel (e.g., a /cert endpoint or mDNS TXT record).
+            #[cfg(feature = "quic-transport")]
+            {
+                let quic_result = crate::transport::try_quic_connection(&addr, &[]).await;
+                if quic_result.attempted {
+                    if quic_result.quic_transport.is_some() {
+                        log::info!(
+                            "QUIC probe to {} succeeded — session will use TCP until \
+                             Stream::Quic is implemented",
+                            addr,
+                        );
+                        // TODO: Use the QUIC transport for the session once
+                        // Stream::Quic variant exists. For now, drop it and
+                        // fall through to TCP.
+                    } else {
+                        log::debug!("QUIC probe to {} skipped/failed: {}", addr, quic_result.reason);
+                    }
+                }
+            }
             return Ok((
                 (
-                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
-                        .await?,
+                    connect_tcp_local(addr, None, CONNECT_TIMEOUT).await?,
                     true,
                     None,
                     None,
@@ -330,6 +356,23 @@ impl Client {
         }
         // Allow connect to {domain}:{port}
         if hbb_common::is_domain_port_str(peer) {
+            // Attempt QUIC for direct domain connections.
+            // Same limitation as direct IP: no peer certificate available yet.
+            #[cfg(feature = "quic-transport")]
+            {
+                let quic_result = crate::transport::try_quic_connection(peer, &[]).await;
+                if quic_result.attempted {
+                    if quic_result.quic_transport.is_some() {
+                        log::info!(
+                            "QUIC probe to {} succeeded — session will use TCP until \
+                             Stream::Quic is implemented",
+                            peer,
+                        );
+                    } else {
+                        log::debug!("QUIC probe to {} skipped/failed: {}", peer, quic_result.reason);
+                    }
+                }
+            }
             return Ok((
                 (
                     connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,
@@ -961,6 +1004,18 @@ impl Client {
     }
 
     /// Create a relay connection to the server.
+    ///
+    /// Attempts QUIC first when `should_use_quic()` returns true, then
+    /// falls back to TCP. The relay server address is resolved from the
+    /// `relay_server` parameter.
+    ///
+    /// # QUIC Integration Status
+    ///
+    /// The QUIC probe validates that a QUIC handshake to the relay server
+    /// succeeds, but the relay protocol messages are still sent over TCP
+    /// because the session layer expects `hbb_common::Stream`. Once
+    /// `Stream::Quic` is added, the QUIC transport returned here can be
+    /// used directly for the relay session.
     async fn create_relay(
         peer: &str,
         uuid: String,
@@ -969,12 +1024,39 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
-        let mut conn = connect_tcp(
-            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
-            CONNECT_TIMEOUT,
-        )
-        .await
-        .with_context(|| "Failed to connect to relay server")?;
+        let relay_addr = ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4);
+
+        // Attempt QUIC for relay connections.
+        // The relay server's certificate would normally be obtained during the
+        // rendezvous handshake. For now, we pass an empty cert which causes
+        // try_quic_connection to skip the attempt gracefully.
+        // TODO: Obtain relay server certificate from rendezvous response.
+        #[cfg(feature = "quic-transport")]
+        {
+            let quic_result = crate::transport::try_quic_connection(&relay_addr, &[]).await;
+            if quic_result.attempted {
+                if quic_result.quic_transport.is_some() {
+                    log::info!(
+                        "QUIC probe to relay {} succeeded — session will use TCP until \
+                         Stream::Quic is implemented",
+                        relay_addr,
+                    );
+                    // TODO: Use the QUIC transport for the relay session once
+                    // Stream::Quic variant exists. For now, drop it and
+                    // fall through to TCP.
+                } else {
+                    log::debug!(
+                        "QUIC probe to relay {} skipped/failed: {}",
+                        relay_addr,
+                        quic_result.reason,
+                    );
+                }
+            }
+        }
+
+        let mut conn = connect_tcp(relay_addr, CONNECT_TIMEOUT)
+            .await
+            .with_context(|| "Failed to connect to relay server")?;
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_request_relay(RequestRelay {
             licence_key: key.to_owned(),
