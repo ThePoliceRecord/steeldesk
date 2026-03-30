@@ -1,4 +1,4 @@
-# CLAUDE.md — RustDesk Client
+# CLAUDE.md — SteelDesk Client
 
 ## Quick Start
 
@@ -143,7 +143,7 @@ Plus vcpkg for: `libvpx`, `libyuv`, `opus`, `aom`. Set `VCPKG_ROOT`.
 
 **826 tests**, all passing (1 pre-existing X11 cursor test needs display). Run with:
 ```bash
-nix develop --command bash -c 'cargo test --lib --features linux-pkg-config -p rustdesk'
+nix develop --command bash -c 'cargo test --lib --features linux-pkg-config -p steeldesk'
 ```
 
 Coverage: video_qos (72), video_service (55), input_service (106), connection (53), keyboard (76), ipc (93), client (83), common (47), auth_2fa (28), custom_server (20), rendezvous_mediator (35), platform/linux (67), transport (50), gpu_pipeline (8), ei_input (11).

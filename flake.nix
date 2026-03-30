@@ -1,5 +1,5 @@
 {
-  description = "RustDesk client development environment";
+  description = "SteelDesk client development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -23,7 +23,7 @@
         # Use `linux-pkg-config` feature (no vcpkg needed).
         # Flutter excluded — install separately or use `nix shell nixpkgs#flutter`.
         devShells.default = pkgs.mkShell {
-          name = "rustdesk-client";
+          name = "steeldesk-client";
 
           nativeBuildInputs = with pkgs; [
             rustToolchain
@@ -72,7 +72,7 @@
           hardeningDisable = [ "all" ];
 
           shellHook = ''
-            echo "RustDesk client dev shell"
+            echo "SteelDesk client dev shell"
             echo "  Rust: $(rustc --version)"
             echo ""
             echo "Build:  cargo build --features linux-pkg-config"

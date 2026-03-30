@@ -122,6 +122,12 @@ impl Drop for SimpleCallOnReturn {
 }
 
 pub fn global_init() -> bool {
+    // Set the branded app name before anything reads config dirs
+    *config::APP_NAME.write().unwrap() = "SteelDesk".to_owned();
+
+    // Migrate old "rustdesk" config directory to "steeldesk" if needed
+    migrate_config_if_needed();
+
     #[cfg(target_os = "linux")]
     {
         if !crate::platform::linux::is_x11() {
@@ -2290,6 +2296,72 @@ pub fn get_control_permission(
     } else {
         None
     }
+}
+
+/// Migrate config directory from old "rustdesk" name to "steeldesk".
+///
+/// On first run after rebranding, if the old config directory exists and
+/// the new one does not, copy everything over so the user keeps their
+/// peer ID, keys, and settings.
+///
+/// Uses the same `directories_next::ProjectDirs` logic that hbb_common's
+/// `Config::path()` uses, but with the old APP_NAME to locate the source.
+pub fn migrate_config_if_needed() {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        use hbb_common::directories_next;
+        use std::path::PathBuf;
+
+        #[cfg(not(target_os = "macos"))]
+        let org = "".to_owned();
+        #[cfg(target_os = "macos")]
+        let org = config::ORG.read().unwrap().clone();
+
+        // Resolve the old config dir using the same method hbb_common uses:
+        // directories_next::ProjectDirs with the old app name.
+        let old_dir: Option<PathBuf> =
+            directories_next::ProjectDirs::from("", &org, "RustDesk")
+                .map(|p| p.config_dir().to_path_buf());
+
+        // Resolve the new config dir (what hbb_common will use with APP_NAME = "SteelDesk")
+        let new_dir: Option<PathBuf> =
+            directories_next::ProjectDirs::from("", &org, "SteelDesk")
+                .map(|p| p.config_dir().to_path_buf());
+
+        if let (Some(old), Some(new)) = (old_dir, new_dir) {
+            if old.exists() && !new.exists() {
+                log::info!(
+                    "Migrating config from {} to {}",
+                    old.display(),
+                    new.display()
+                );
+                match copy_dir_all(&old, &new) {
+                    Ok(()) => log::info!("Config migration complete"),
+                    Err(e) => log::warn!("Config migration failed: {}", e),
+                }
+            }
+        }
+    }
+}
+
+/// Recursively copy a directory tree.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn copy_dir_all(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
